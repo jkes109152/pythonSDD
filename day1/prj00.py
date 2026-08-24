@@ -1,8 +1,5 @@
 #######################定義函式區########################
 # 沒有輸入值，沒有返回值
-from numpy import add
-
-
 def show_message():
     print("開始複習 function!")
 
