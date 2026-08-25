@@ -350,12 +350,35 @@ class Explosion:
             )
 
 
+class VictoryCircle:
+    """勝利時顯示逐漸變大的彩色圓圈。"""
+
+    def __init__(self, x, y, color):
+        self.center = (x, y)
+        self.color = color
+        self.radius = 5
+        self.max_radius = 70
+
+    def update(self):
+        self.radius += 3
+        return self.radius <= self.max_radius
+
+    def draw(self, surface):
+        pygame.draw.circle(
+            surface,
+            self.color,
+            self.center,
+            self.radius,
+            3,
+        )
+
+
 ######################定義函式區######################
 
 
 def create_bricks():
     bricks = []
-    rows = 5
+    rows = 8
     columns = 9
     brick_width = 72
     brick_height = 24
@@ -393,7 +416,7 @@ def create_bricks():
         "hard_2",
         "hard_3",
     ]
-    brick_counts = [2, 2, 3, 3, 3, 6, 6]
+    brick_counts = [2, 2, 3, 3, 3, 10, 10]
     brick_type_colors = [
         EXPLOSION_COLOR,
         PIERCING_COLOR,
@@ -418,6 +441,14 @@ def create_bricks():
                 placed_count += 1
 
     return bricks
+
+
+def check_win(bricks):
+    """只要還有一塊存活的磚塊，就還沒有勝利。"""
+    for brick in bricks:
+        if brick.alive:
+            return False
+    return True
 
 
 def bounce_from_rect(ball, target_rect):
@@ -579,6 +610,16 @@ def draw_game_over(surface, title_font, message_font):
     surface.blit(message, message_rect)
 
 
+def draw_victory(surface, title_font, message_font):
+    """顯示勝利與重新開始提示。"""
+    title = title_font.render("YOU WIN", True, WIDE_COLOR)
+    message = message_font.render("Press R to Restart", True, BALL_COLOR)
+    title_rect = title.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 25))
+    message_rect = message.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 25))
+    surface.blit(title, title_rect)
+    surface.blit(message, message_rect)
+
+
 ######################初始化設定######################
 
 pygame.init()
@@ -586,10 +627,11 @@ pygame.init()
 ######################遊戲視窗設定######################
 
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Checkpoint 06：特殊球與生命")
+pygame.display.set_caption("Checkpoint 06：功能磚與分數")
 clock = pygame.time.Clock()
 title_font = pygame.font.Font(None, 58)
 message_font = pygame.font.Font(None, 34)
+score_font = pygame.font.Font(None, 30)
 
 ######################磚塊######################
 
@@ -599,18 +641,25 @@ bricks = create_bricks()
 
 explosions = []
 
+######################勝利動畫######################
+
+victory_circles = []
+victory_wait = 0
+
 ######################底板設定######################
 
 paddle = Paddle()
 
 ######################球設定######################
 
-ball = Ball(paddle)
+balls = [Ball(paddle)]
 
-######################生命與遊戲狀態######################
+######################生命、分數與遊戲狀態######################
 
 lives = 3
+score = 0
 game_over = False
+game_won = False
 
 ######################主程式######################
 
@@ -626,29 +675,92 @@ while running:
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 running = False
-            elif event.key == pygame.K_SPACE and not game_over:
-                ball.launch()
-            elif event.key == pygame.K_r and game_over:
-                # 重新產生磚塊並恢復生命，開始新的一局。
+            elif event.key == pygame.K_SPACE and not game_over and not game_won:
+                # 等待中的球會一起從底板發射。
+                for ball in balls:
+                    ball.launch()
+            elif event.key == pygame.K_r and (game_over or game_won):
+                # 重新產生磚塊並恢復生命、分數與底板。
                 bricks = create_bricks()
                 explosions = []
+                victory_circles = []
+                victory_wait = 0
                 lives = 3
+                score = 0
                 game_over = False
-                ball.reset(paddle)
+                game_won = False
+                paddle.reset_size()
+                paddle.wide_frames = 0
+                balls = [Ball(paddle)]
 
-    if not game_over:
+    if not game_over and not game_won:
         # 取得鍵盤狀態並更新遊戲物件
         keys = pygame.key.get_pressed()
         paddle.update(keys)
-        ball_lost = ball.update(paddle)
+        paddle.update_power()
 
-        if ball_lost:
+        active_balls = []
+        new_balls = []
+
+        # 每顆球分別移動與碰撞，掉落的球不放回 active_balls。
+        for ball in balls:
+            ball_lost = ball.update(paddle)
+            if not ball_lost:
+                active_balls.append(ball)
+                gained_score, power_type = handle_collisions(
+                    ball,
+                    paddle,
+                    bricks,
+                    explosions,
+                )
+                score += gained_score
+
+                # 功能磚塊打碎後會立即生效。
+                if power_type == "multiball":
+                    extra_balls = create_extra_balls(ball, paddle)
+                    for extra_ball in extra_balls:
+                        new_balls.append(extra_ball)
+                elif power_type == "life":
+                    lives += 1
+                elif power_type == "wide":
+                    paddle.make_wide()
+
+        # 新產生的球從下一幀開始移動，避免同一幀重複碰撞。
+        for new_ball in new_balls:
+            active_balls.append(new_ball)
+        balls = active_balls
+
+        # 只有所有球都掉落，才會扣除一條生命。
+        if len(balls) == 0:
             lives -= 1
-            ball.reset(paddle)
             if lives == 0:
                 game_over = True
-        else:
-            handle_collisions(ball, paddle, bricks, explosions)
+            else:
+                balls = [Ball(paddle)]
+
+        # 所有磚塊都被打碎時，停止遊戲並進入勝利畫面。
+        if not game_over and check_win(bricks):
+            game_won = True
+
+    # 勝利時每隔 15 幀，在隨機位置加入彩色圓圈。
+    if game_won:
+        victory_wait += 1
+        if victory_wait == 15:
+            circle_x = random.randint(40, WIDTH - 40)
+            circle_y = random.randint(50, HEIGHT - 50)
+            color_number = random.randint(0, len(BRICK_COLORS) - 1)
+            circle_color = BRICK_COLORS[color_number]
+            victory_circles.append(
+                VictoryCircle(circle_x, circle_y, circle_color)
+            )
+            victory_wait = 0
+
+    # 更新勝利圓圈，只留下還沒有播放完的圓圈。
+    active_victory_circles = []
+    for circle in victory_circles:
+        if circle.update():
+            active_victory_circles.append(circle)
+    victory_circles = active_victory_circles
 
     # 更新爆炸動畫，只留下還沒有播放完的動畫。
     active_explosions = []
@@ -660,16 +772,24 @@ while running:
     # 清除畫面
     screen.fill(BACKGROUND)
 
-    # 顯示磚塊、底板、球與生命
+    # 彩色圓圈畫在背景，再顯示其他遊戲物件。
+    for circle in victory_circles:
+        circle.draw(screen)
+
+    # 顯示磚塊、底板、所有球、生命與分數
     for brick in bricks:
         brick.draw(screen)
     for explosion in explosions:
         explosion.draw(screen)
     paddle.draw(screen)
-    ball.draw(screen)
+    for ball in balls:
+        ball.draw(screen)
     draw_lives(screen, lives)
+    draw_score(screen, score, score_font)
 
-    if game_over:
+    if game_won:
+        draw_victory(screen, title_font, message_font)
+    elif game_over:
         draw_game_over(screen, title_font, message_font)
 
     # 更新畫面
