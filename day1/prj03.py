@@ -20,32 +20,6 @@ BRICK_COLORS = [
     (74, 222, 128),
     (56, 189, 248),
 ]
-############################初始化設定############################
-pygame.init()
-############################遊戲視窗設定############################
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("python x sdd")
-clock = pygame.time.Clock()
-
-
-############################定義函式區############################
-def create_bricks():
-    """用同一份Brick類別建立五列九欄磚塊"""
-    bricks = []
-    rows = 5
-    columns = 9
-    brick_width = 72
-    brick_height = 24
-    gap = 8
-    start_x = 44
-    start_y = 70
-    for row in range(rows):
-        for column in range(columns):
-            x = start_x + (brick_width + gap) * column
-            y = start_y + (brick_height + gap) * row
-            color = BRICK_COLORS[row]
-            bricks.append(Brick(x, y, brick_width, brick_height, color))
-    return bricks
 
 
 ############################物件類別############################
@@ -77,6 +51,35 @@ class Paddle:
 
     def draw(self, surface):
         pygame.draw.rect(surface, PADDLE_COLOR, self.rect, border_radius=8)
+
+
+############################定義函式區############################
+def create_bricks():
+    """用同一份Brick類別建立五列九欄磚塊"""
+    bricks = []
+    rows = 5
+    columns = 9
+    brick_width = 72
+    brick_height = 24
+    gap = 8
+    start_x = 44
+    start_y = 70
+    for row in range(rows):
+        for column in range(columns):
+            x = start_x + (brick_width + gap) * column
+            y = start_y + (brick_height + gap) * row
+            color = BRICK_COLORS[row]
+            bricks.append(Brick(x, y, brick_width, brick_height, color))
+    return bricks
+
+
+############################初始化設定############################
+pygame.init()
+
+############################遊戲視窗設定############################
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("python x sdd")
+clock = pygame.time.Clock()
 
 
 ############################磚塊############################
