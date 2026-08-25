@@ -1,0 +1,12 @@
+Deck: PythonSDD練習
+Task: Add five divider slide images labeled DAY 1 through DAY 5.
+
+Claim ledger
+- Visible labels: DAY 1, DAY 2, DAY 3, DAY 4, DAY 5.
+- Source: User request in this Codex task, 2026-08-25.
+- Verification: No external factual claims, formulas, dates, or curriculum topics are introduced.
+
+Delivery plan
+- Replace the visual content of the existing first-slide Day1 placeholder by applying the DAY 1 image as its background.
+- Append DAY 2 through DAY 5 after the existing Day 1 instructional content.
+- Preserve all existing instructional slides.

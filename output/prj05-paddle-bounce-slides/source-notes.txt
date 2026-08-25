@@ -1,0 +1,88 @@
+Deck: PythonSDD練習 — Day 2 paddle bounce explanation
+Date: 2026-08-25
+Target insertion: after DAY 2 divider and before DAY 3 divider.
+
+Communication job
+By the end, a beginner Python/Pygame learner should understand that prj05.py derives the ball's horizontal bounce from the ball center's position relative to the paddle center, while forcing the vertical component upward.
+
+Claim ledger
+
+1. Paddle collision is handled only when the ball is moving downward and the rectangles overlap.
+   Source: C:\Users\lamun\OneDrive\Desktop\pythonSDD\day2\prj05.py, lines 147–150.
+   Code: ball.velocity.y > 0 and ball.rect.colliderect(paddle.rect)
+   Status: verified from source.
+
+2. pygame.Rect.colliderect() returns true when the rectangles overlap; merely touching along an edge is not an overlap.
+   Source: Pygame Rect 2.6.0 official documentation, accessed 2026-08-25.
+   URL: https://www.pygame.org/docs/ref/rect.html
+   Supporting section: colliderect(); Rect right/bottom edges and collision notes.
+   Status: verified from official documentation.
+
+3. After collision, the code moves the ball rectangle to the top of the paddle and synchronizes the float position.
+   Source: prj05.py, lines 151–152.
+   Status: verified from source.
+
+4. The vertical velocity is forced upward with ball.velocity.y = -abs(ball.velocity.y).
+   Source: prj05.py, line 153.
+   Status: verified from source.
+
+5. The horizontal control value is the normalized center difference:
+   offset = (ball.rect.centerx - paddle.rect.centerx) / (paddle.rect.width / 2)
+   Source: prj05.py, line 155.
+   Status: verified from source.
+
+6. The horizontal velocity is ball.velocity.x = 6 * offset.
+   Source: prj05.py, line 156.
+   Status: verified from source.
+
+7. With paddle center x=400 and width=120, half-width=60:
+   ball center 370 -> offset -0.5 -> velocity.x -3
+   ball center 400 -> offset 0 -> velocity.x 0
+   ball center 430 -> offset +0.5 -> velocity.x +3
+   Status: independently recalculated on 2026-08-25.
+
+8. Because colliderect() permits partial horizontal overlap and the code does not clamp offset, an extreme edge graze can produce an offset slightly beyond -1 or +1. For an 18-pixel ball and 120-pixel paddle, one-pixel overlap can reach approximately ±1.133 and velocity.x approximately ±6.8.
+   Sources: prj05.py Ball radius/rect width lines 48–52; Paddle width line 33; collision and offset lines 150, 155–156; official colliderect() semantics.
+   Status: independently derived and checked.
+
+9. The worked values -3, 0, and +3 are examples, not an exhaustive set. With paddle center x=400 and width=120, ball center 390 gives velocity.x = 6 * ((390 - 400) / 60) = -1. The formula always uses the paddle's current paddle.rect.centerx, so moving the paddle changes the reference center automatically.
+   Source: user correction discussion plus prj05.py lines 155–156.
+   Status: independently recalculated and verified from source on 2026-08-25.
+
+10. A symmetric five-sample teaching set is clearer: centers 370, 390, 400, 410, and 430 produce velocity.x values -3, -1, 0, +1, and +3. These represent left, slight left, center, slight right, and right, but the implementation is not limited to five outcomes.
+    Source: user correction discussion plus prj05.py lines 155–156.
+    Status: independently recalculated and verified from source on 2026-08-25.
+
+Slide sequence
+1. The code converts hit position into horizontal speed.
+2. Collision gate: downward motion plus rectangle overlap.
+3. Compare ball center with paddle center.
+4. Normalize the center difference into offset.
+5. Convert offset to horizontal velocity.
+6. Separate the ball and force vertical velocity upward.
+7. Three worked examples.
+8. Four-step execution sequence.
+9. Conceptual synthesis and the role of constant 6.
+10. Verification sources.
+
+Final accepted assets
+- slide-01.png
+- slide-02.png
+- slide-03.png
+- slide-04.png
+- slide-05.png
+- slide-06-v2.png
+- slide-07-v6.png
+- slide-08.png
+- slide-09-v2.png
+- slide-10-v2.png
+
+QA notes
+- Rejected slide-06.png because the illustrated ball still overlapped the paddle after separation.
+- Rejected slide-07.png and intermediate generated revisions because the ball positions contradicted the worked x values; the final v4 uses direction arrows without a misleading coordinate diagram.
+- Replaced slide-07-v4.png after correction discussion because its title could imply that only three horizontal velocities exist. The accepted v5 labels four values as samples, adds the 390 -> -1 example, and states that paddle.rect.centerx is read from the paddle's current position.
+- Google Slides page 16 background was replaced with slide-07-v5.png; total page count remained 22 and the document reported saved to Google Drive.
+- Replaced slide-07-v5.png after a second correction discussion because the four examples were visually asymmetric and omitted a slight-right counterpart. The accepted v6 uses five symmetric samples: -3, -1, 0, +1, +3.
+- Final browser QA: slide 16 uses slide-07-v6.png; slide 19 is the source page; slides 20–22 are DAY 3, DAY 4, and DAY 5. Total count is 22 and Google Slides reports saved to Drive.
+- Rejected slide-09.png because it added the incorrect unsourced formula vy = -1.
+- Rejected slide-10.png because it added unsupplied offset labels.

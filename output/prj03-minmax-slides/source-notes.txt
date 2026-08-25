@@ -1,0 +1,12 @@
+Deck: prj03.py paddle min/max boundaries
+
+Verified claim
+- WIDTH = 800 and self.rect.width = 120 imply 0 <= self.rect.x <= 680.
+- At self.rect.x = 680, rect.right = 680 + 120 = 800.
+- The covered horizontal pixels are 680 through 799; coordinate 800 is the exclusive right edge and is not a covered screen pixel.
+
+Sources
+- Workspace source: day1/prj03.py (WIDTH = 800; paddle Rect width = 120; clamp uses WIDTH - self.rect.width).
+- Pygame official documentation: https://www.pygame.org/docs/ref/rect.html
+  The Rect area excludes the right and bottom edges, and rect.right lies one pixel outside the actual border.
+- User correction in this Codex task, verified against the workspace code and official Pygame Rect documentation.
