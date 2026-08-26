@@ -1,0 +1,2 @@
+# Project-local Spec Kit CLI, pinned for reproducible SDD tooling.
+specify-cli @ git+https://github.com/github/spec-kit.git@v1.0.1
