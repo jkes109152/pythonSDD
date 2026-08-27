@@ -7,7 +7,6 @@ importing Ursina. The graphical scene translates them into visual entities.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import pi, sin
 from typing import Optional
 
 from . import config
@@ -18,6 +17,15 @@ from .state import (
     LockState,
     SquadRole,
     WeaponKind,
+)
+from .rules import (
+    desired_aircraft_heading,
+    direction_to_yaw_pitch,
+    normalize_vector,
+    rotate_direction_towards,
+    steer_forward,
+    swept_segment_hits_sphere,
+    vector_length,
 )
 
 
@@ -70,6 +78,7 @@ class AntiAircraftGun(WeaponPickup):
     lock_state: LockState = LockState.WHITE
     lock_elapsed: float = 0.0
     target_aircraft_id: Optional[str] = None
+    target_in_zone: bool = False
     fire_cooldown: float = 0.0
 
     def update_cooldown(self, delta_seconds: float) -> None:
@@ -80,6 +89,7 @@ class AntiAircraftGun(WeaponPickup):
         self.lock_state = LockState.WHITE
         self.lock_elapsed = 0.0
         self.target_aircraft_id = None
+        self.target_in_zone = False
 
 
 @dataclass
@@ -150,69 +160,88 @@ class Aircraft:
     max_health: int = 0
     phase: AircraftPhase = AircraftPhase.APPROACHING
     crew_spawned: bool = False
+    position: Optional[tuple[float, float, float]] = None
+    forward: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    yaw: float = 0.0
+    pitch: float = 0.0
+    speed: float = 0.0
+    max_yaw_rate: float = 0.0
+    max_pitch_rate: float = 0.0
+    flight_elapsed: float = 0.0
+    evasion_phase: float = 0.0
 
     def __post_init__(self) -> None:
         self.aircraft_type = AircraftType(self.aircraft_type)
-        profile = {
-            AircraftType.NORMAL: (
-                config.AIRCRAFT_NORMAL_FLIGHT_DURATION_SECONDS,
-                config.AIRCRAFT_NORMAL_EVASION_AMPLITUDE,
-                config.AIRCRAFT_NORMAL_EVASION_FREQUENCY,
-                1,
-            ),
-            AircraftType.MANPOWER_SUPPORT: (
-                config.AIRCRAFT_SUPPORT_FLIGHT_DURATION_SECONDS,
-                config.AIRCRAFT_SUPPORT_EVASION_AMPLITUDE,
-                config.AIRCRAFT_SUPPORT_EVASION_FREQUENCY,
-                1,
-            ),
-            AircraftType.FAST: (
-                config.AIRCRAFT_FAST_FLIGHT_DURATION_SECONDS,
-                config.AIRCRAFT_FAST_EVASION_AMPLITUDE,
-                config.AIRCRAFT_FAST_EVASION_FREQUENCY,
-                1,
-            ),
-            AircraftType.ARMORED_BOSS: (
-                config.AIRCRAFT_ARMORED_FLIGHT_DURATION_SECONDS,
-                config.AIRCRAFT_ARMORED_EVASION_AMPLITUDE,
-                config.AIRCRAFT_ARMORED_EVASION_FREQUENCY,
-                config.ARMORED_AIRCRAFT_HEALTH,
-            ),
-        }[self.aircraft_type]
+        from .rules import aircraft_profile
+
+        profile = aircraft_profile(self.aircraft_type)
         if self.flight_duration == config.AIRCRAFT_FLIGHT_DURATION_SECONDS:
-            self.flight_duration = profile[0]
+            self.flight_duration = profile.flight_duration
         if self.evasion_amplitude <= 0.0:
-            self.evasion_amplitude = profile[1]
+            self.evasion_amplitude = profile.evasion_amplitude
         if self.evasion_frequency <= 0.0:
-            self.evasion_frequency = profile[2]
+            self.evasion_frequency = profile.evasion_frequency
         if self.max_health <= 0:
-            self.max_health = profile[3]
+            self.max_health = profile.max_health
         if self.health <= 0:
             self.health = self.max_health
-
-    @property
-    def position(self) -> tuple[float, float, float]:
-        progress = max(0.0, min(1.0, self.path_progress))
-        base_position = tuple(
-            start + (target - start) * progress
-            for start, target in zip(self.start_position, self.target_position)
-        )
-        lateral_offset = self.evasion_amplitude * sin(
-            self.evasion_elapsed * self.evasion_frequency * 2.0 * pi
-        )
-        return (base_position[0] + lateral_offset, base_position[1], base_position[2])
+        if self.position is None:
+            self.position = tuple(self.start_position)
+        else:
+            self.position = tuple(float(component) for component in self.position)
+        if self.flight_elapsed <= 0.0 and self.path_progress > 0.0:
+            self.flight_elapsed = self.path_progress * max(0.0, self.flight_duration)
+        if self.forward == (0.0, 0.0, 0.0):
+            self.forward = normalize_vector(
+                tuple(target - start for start, target in zip(self.position, self.target_position))
+            )
+        else:
+            self.forward = normalize_vector(self.forward)
+        self.yaw, self.pitch = direction_to_yaw_pitch(self.forward)
+        if self.speed <= 0.0:
+            distance = vector_length(
+                tuple(target - start for start, target in zip(self.start_position, self.target_position))
+            )
+            self.speed = distance / max(1e-6, self.flight_duration)
+        if self.max_yaw_rate <= 0.0:
+            self.max_yaw_rate = profile.max_yaw_rate
+        if self.max_pitch_rate <= 0.0:
+            self.max_pitch_rate = profile.max_pitch_rate
 
     def advance(self, delta_seconds: float) -> None:
         if self.phase in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED):
             return
+        delta_seconds = max(0.0, float(delta_seconds))
         if self.flight_duration <= 0:
             self.path_progress = 1.0
-        else:
-            self.path_progress = min(
-                1.0,
-                self.path_progress + max(0.0, delta_seconds) / self.flight_duration,
-            )
-        self.evasion_elapsed += max(0.0, delta_seconds)
+            self.position = tuple(self.target_position)
+            return
+        if delta_seconds <= 0.0:
+            return
+
+        self.flight_elapsed += delta_seconds
+        self.evasion_elapsed = self.flight_elapsed
+        self.evasion_phase = self.flight_elapsed
+        desired_forward = desired_aircraft_heading(
+            self.position,
+            self.target_position,
+            evasion_phase=self.evasion_phase,
+            evasion_amplitude=self.evasion_amplitude,
+            evasion_frequency=self.evasion_frequency,
+        )
+        self.forward = steer_forward(
+            self.forward,
+            desired_forward,
+            max_yaw_degrees=self.max_yaw_rate * delta_seconds,
+            max_pitch_degrees=self.max_pitch_rate * delta_seconds,
+        )
+        self.yaw, self.pitch = direction_to_yaw_pitch(self.forward)
+        distance = self.speed * delta_seconds
+        self.position = tuple(
+            self.position[index] + self.forward[index] * distance
+            for index in range(3)
+        )
+        self.path_progress = min(1.0, self.flight_elapsed / self.flight_duration)
 
     def estimated_impact_seconds(self) -> float:
         return max(0.0, (1.0 - self.path_progress) * self.flight_duration)
@@ -245,6 +274,99 @@ class Aircraft:
             return False
         self.phase = AircraftPhase.IMPACTED
         return True
+
+
+@dataclass(frozen=True)
+class MissileStep:
+    """Result of one guided missile simulation step."""
+
+    position: tuple[float, float, float]
+    hit: bool = False
+    expired: bool = False
+    previous_position: Optional[tuple[float, float, float]] = None
+
+
+@dataclass
+class GuidedMissile:
+    """Engine-independent target-bound missile with swept collision."""
+
+    id: str
+    target_aircraft_id: str
+    position: tuple[float, float, float]
+    forward: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    speed: float = config.GUIDED_MISSILE_SPEED
+    turn_rate: float = config.GUIDED_MISSILE_TURN_RATE_DEGREES
+    hit_radius: float = config.GUIDED_MISSILE_HIT_RADIUS
+    lifetime_remaining: float = config.GUIDED_MISSILE_LIFETIME_SECONDS
+    consumed: bool = False
+    damage_applied: bool = False
+
+    def __post_init__(self) -> None:
+        self.position = tuple(float(component) for component in self.position)
+        normalized = normalize_vector(self.forward)
+        self.forward = normalized if normalized != (0.0, 0.0, 0.0) else (0.0, 0.0, 1.0)
+        self.speed = max(0.0, float(self.speed))
+        self.turn_rate = max(0.0, float(self.turn_rate))
+        self.hit_radius = max(0.0, float(self.hit_radius))
+        self.lifetime_remaining = max(0.0, float(self.lifetime_remaining))
+
+    def advance(
+        self,
+        delta_seconds: float,
+        target_position: tuple[float, float, float],
+    ) -> MissileStep:
+        previous_position = self.position
+        target_position = tuple(float(component) for component in target_position)
+        if self.consumed:
+            return MissileStep(
+                self.position,
+                hit=False,
+                expired=True,
+                previous_position=previous_position,
+            )
+
+        # A target already touching the missile wins over lifetime expiry.
+        if vector_length(
+            tuple(target - current for target, current in zip(target_position, self.position))
+        ) <= self.hit_radius + 1e-9:
+            self.consumed = True
+            return MissileStep(
+                self.position,
+                hit=True,
+                expired=False,
+                previous_position=previous_position,
+            )
+
+        delta_seconds = max(0.0, float(delta_seconds))
+        desired_forward = normalize_vector(
+            tuple(target - current for target, current in zip(target_position, self.position))
+        )
+        self.forward = rotate_direction_towards(
+            self.forward,
+            desired_forward,
+            self.turn_rate * delta_seconds,
+        )
+        proposed_position = tuple(
+            self.position[index] + self.forward[index] * self.speed * delta_seconds
+            for index in range(3)
+        )
+        hit = swept_segment_hits_sphere(
+            previous_position,
+            proposed_position,
+            target_position,
+            self.hit_radius,
+        )
+        self.position = proposed_position
+        self.lifetime_remaining = max(0.0, self.lifetime_remaining - delta_seconds)
+        expired = not hit and self.lifetime_remaining <= 0.0
+        if hit or expired:
+            self.consumed = True
+        return MissileStep(
+            self.position,
+            hit=hit,
+            expired=expired,
+            previous_position=previous_position,
+        )
 
 
 @dataclass

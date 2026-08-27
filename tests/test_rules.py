@@ -12,6 +12,8 @@ from air_defense.entities import (
     Aircraft,
     AntiAircraftGun,
     CrewMember,
+    GuidedMissile,
+    MissileStep,
     Player,
     SniperRifle,
     TargetBuilding,
@@ -22,6 +24,7 @@ from air_defense.rules import (
     add_reinforcement,
     aircraft_profile,
     advance_crew_behavior,
+    apply_guided_missile_damage,
     can_fire_anti_air,
     can_fire_pistol,
     can_fire_sniper,
@@ -177,11 +180,13 @@ class SessionStateTests(unittest.TestCase):
 
 
 class LockAndWeaponRuleTests(unittest.TestCase):
-    def test_lock_tracker_resets_when_target_is_lost(self) -> None:
-        tracker = LockOnTracker(lock_duration=3.0)
+    def test_lock_tracker_decays_when_target_is_lost(self) -> None:
+        tracker = LockOnTracker(lock_duration=3.0, scope_enabled=True)
 
         self.assertEqual(tracker.update(True, 1.0), LockState.RED_TRACKING)
-        self.assertEqual(tracker.update(False, 0.01), LockState.WHITE)
+        self.assertEqual(tracker.update(False, 0.01), LockState.RED_TRACKING)
+        self.assertAlmostEqual(tracker.lock_elapsed, 0.96, places=6)
+        self.assertEqual(tracker.update(False, 0.75), LockState.WHITE)
         self.assertEqual(tracker.lock_elapsed, 0.0)
 
     def test_one_weapon_at_a_time(self) -> None:
@@ -205,7 +210,7 @@ class LockAndWeaponRuleTests(unittest.TestCase):
         self.assertIsNone(empty)
 
     def test_lock_flash_period_and_exact_ready_threshold(self) -> None:
-        tracker = LockOnTracker(lock_duration=3.0)
+        tracker = LockOnTracker(lock_duration=3.0, scope_enabled=True)
 
         self.assertEqual(tracker.update(True, 0.11), LockState.RED_TRACKING)
         self.assertTrue(tracker.flash_visible(0.12))
@@ -222,22 +227,25 @@ class LockAndWeaponRuleTests(unittest.TestCase):
         self.assertEqual(lock_status_label(LockState.GREEN_READY), "可發射")
 
     def test_lock_loss_warning_and_fire_gates(self) -> None:
-        tracker = LockOnTracker()
+        tracker = LockOnTracker(scope_enabled=True)
         tracker.update(True, 2.0)
-        self.assertEqual(tracker.update(False, 0.0), LockState.WHITE)
+        self.assertEqual(tracker.update(False, 0.0), LockState.RED_TRACKING)
+        self.assertEqual(tracker.lock_elapsed, 2.0)
+        self.assertEqual(tracker.update(False, 0.75), LockState.WHITE)
         self.assertEqual(tracker.lock_elapsed, 0.0)
 
         self.assertTrue(warning_active(8.0))
         self.assertFalse(warning_active(8.01))
         self.assertFalse(warning_active(None))
         self.assertFalse(can_fire_anti_air(LockState.RED_TRACKING, 0.0))
-        self.assertTrue(can_fire_anti_air(LockState.GREEN_READY, 0.0))
-        self.assertFalse(can_fire_anti_air(LockState.GREEN_READY, 0.01))
+        self.assertTrue(can_fire_anti_air(LockState.GREEN_READY, 0.0, target_in_zone=True))
+        self.assertFalse(can_fire_anti_air(LockState.GREEN_READY, 0.01, target_in_zone=True))
         self.assertFalse(
             can_fire_anti_air(
                 LockState.GREEN_READY,
                 0.0,
                 WeaponKind.SNIPER,
+                False,
             )
         )
         self.assertTrue(can_fire_sniper(0.0, WeaponKind.SNIPER))
@@ -442,7 +450,12 @@ class StatisticsTests(unittest.TestCase):
         session.held_weapon = WeaponKind.SNIPER
         self.assertFalse(session.can_use_anti_air())
         self.assertFalse(
-            can_fire_anti_air(LockState.GREEN_READY, 0.0, session.held_weapon)
+            can_fire_anti_air(
+                LockState.GREEN_READY,
+                0.0,
+                session.held_weapon,
+                target_in_zone=True,
+            )
         )
         session.transition(SessionEvent.AIRCRAFT_DESTROYED)
         current_encounter = session.active_encounter_id
@@ -751,6 +764,95 @@ class ExpandedGroundRuleTests(unittest.TestCase):
                 break
         self.assertTrue(member.at_city)
         self.assertEqual(member.position, config.CITY_ATTACK_POINT)
+
+
+class GuidedMissileIntegrationRuleTests(unittest.TestCase):
+    def test_damage_is_delayed_until_collision(self) -> None:
+        aircraft = Aircraft(id="aircraft-delayed")
+        missile = GuidedMissile(
+            id="missile-delayed",
+            target_aircraft_id=aircraft.id,
+            position=(aircraft.position[0], aircraft.position[1], aircraft.position[2] + 10.0),
+            forward=(0.0, 0.0, -1.0),
+            speed=100.0,
+            turn_rate=0.0,
+        )
+
+        self.assertEqual(aircraft.health, aircraft.max_health)
+        step = missile.advance(0.1, aircraft.position)
+        self.assertIsInstance(step, MissileStep)
+        self.assertTrue(step.hit)
+        self.assertTrue(apply_guided_missile_damage(aircraft, missile, step, active_aircraft_id=aircraft.id))
+        self.assertEqual(aircraft.health, 0)
+
+    def test_armored_aircraft_takes_exactly_five_collision_hits(self) -> None:
+        aircraft = Aircraft(id="aircraft-armored-missiles", aircraft_type=AircraftType.ARMORED_BOSS)
+
+        for hit_number in range(1, config.ARMORED_AIRCRAFT_HEALTH + 1):
+            missile = GuidedMissile(
+                id=f"missile-armored-{hit_number}",
+                target_aircraft_id=aircraft.id,
+                position=aircraft.position,
+            )
+            step = missile.advance(0.0, aircraft.position)
+            destroyed = apply_guided_missile_damage(
+                aircraft,
+                missile,
+                step,
+                active_aircraft_id=aircraft.id,
+            )
+            self.assertEqual(aircraft.health, config.ARMORED_AIRCRAFT_HEALTH - hit_number)
+            self.assertEqual(destroyed, hit_number == config.ARMORED_AIRCRAFT_HEALTH)
+
+    def test_simultaneous_contacts_are_ordered_and_terminal_state_blocks_second_hit(self) -> None:
+        aircraft = Aircraft(id="aircraft-simultaneous")
+        missiles = [
+            GuidedMissile(
+                id=f"missile-simultaneous-{index}",
+                target_aircraft_id=aircraft.id,
+                position=aircraft.position,
+            )
+            for index in (1, 2)
+        ]
+        steps = [missile.advance(0.0, aircraft.position) for missile in missiles]
+
+        self.assertTrue(apply_guided_missile_damage(aircraft, missiles[0], steps[0], active_aircraft_id=aircraft.id))
+        self.assertFalse(apply_guided_missile_damage(aircraft, missiles[1], steps[1], active_aircraft_id=aircraft.id))
+        self.assertEqual(aircraft.health, 0)
+
+    def test_impact_and_stale_target_cannot_receive_late_missile_damage(self) -> None:
+        impacted = Aircraft(id="aircraft-impacted")
+        impacted.impact()
+        impact_missile = GuidedMissile(
+            id="missile-impact",
+            target_aircraft_id=impacted.id,
+            position=impacted.position,
+        )
+        impact_step = impact_missile.advance(0.0, impacted.position)
+        self.assertFalse(
+            apply_guided_missile_damage(
+                impacted,
+                impact_missile,
+                impact_step,
+                active_aircraft_id=impacted.id,
+            )
+        )
+
+        current = Aircraft(id="aircraft-current")
+        stale = GuidedMissile(
+            id="missile-stale",
+            target_aircraft_id="aircraft-old",
+            position=current.position,
+        )
+        stale_step = stale.advance(0.0, current.position)
+        self.assertFalse(
+            apply_guided_missile_damage(
+                current,
+                stale,
+                stale_step,
+                active_aircraft_id=current.id,
+            )
+        )
 
 
 if __name__ == "__main__":

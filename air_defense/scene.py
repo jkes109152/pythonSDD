@@ -8,15 +8,23 @@ objects.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import radians, tan
 from pathlib import Path
 from typing import Iterable, Optional
 
-from ursina import Entity, Vec3, camera, color, destroy, raycast, scene as ursina_scene
+from ursina import Entity, Vec3, camera, color, destroy, raycast, scene as ursina_scene, window
 from ursina.prefabs.first_person_controller import FirstPersonController
 
 from . import config
-from .entities import Aircraft, GroundEncounter
-from .rules import aircraft_profile
+from .entities import Aircraft, GroundEncounter, GuidedMissile
+from .rules import (
+    aircraft_profile,
+    apply_aim_assist,
+    clamp_screen_radius,
+    is_inside_lock_zone,
+    lock_zone_radius,
+    raycast_hit_matches_target,
+)
 from .state import AircraftType
 
 
@@ -36,6 +44,18 @@ class WorldHandles:
     obstacles: tuple[Entity, ...] = ()
 
 
+@dataclass(frozen=True)
+class AircraftScreenTarget:
+    """Transient projection data shared by lock evaluation and the HUD."""
+
+    visible: bool
+    screen_position: tuple[float, float]
+    hud_position: tuple[float, float]
+    screen_radius: float
+    distance_from_center: float
+    in_lock_zone: bool
+
+
 class AirDefenseScene:
     """Creates the long plain, collidable cover route and visual adapters."""
 
@@ -46,6 +66,7 @@ class AirDefenseScene:
         self._dynamic_entities: list[Entity] = []
         self.player_controller: Optional[FirstPersonController] = None
         self.aircraft_entity: Optional[Entity] = None
+        self.missile_entities: dict[str, Entity] = {}
         self.crew_entities: dict[str, Entity] = {}
         self._effects: list[tuple[Entity, float]] = []
 
@@ -218,21 +239,41 @@ class AirDefenseScene:
             self.player_controller.enabled = enabled
             self.player_controller.cursor.visible = False
 
-    def set_scope_enabled(self, enabled: bool) -> None:
-        """Bridge the sniper scope state to the actual camera field of view."""
+    def set_scope_enabled(self, enabled: bool, *, anti_air: bool = False) -> None:
+        """Bridge sniper or anti-air scope state to the actual camera FOV."""
 
-        camera.fov = config.CAMERA_SCOPE_FOV if enabled else config.CAMERA_DEFAULT_FOV
+        if not enabled:
+            camera.fov = config.CAMERA_DEFAULT_FOV
+        elif anti_air:
+            camera.fov = config.AA_SCOPE_FOV
+        else:
+            camera.fov = config.CAMERA_SCOPE_FOV
 
-    def clear_dynamic(self) -> None:
+    def viewport_size(self) -> tuple[float, float]:
+        size = getattr(window, "size", None)
+        if size is None:
+            return float(config.WINDOW_WIDTH), float(config.WINDOW_HEIGHT)
+        try:
+            return max(1.0, float(size[0])), max(1.0, float(size[1]))
+        except (TypeError, ValueError, IndexError):
+            return float(config.WINDOW_WIDTH), float(config.WINDOW_HEIGHT)
+
+    def clear_dynamic(self, *, clear_effects: bool = True) -> None:
+        """Remove gameplay entities, optionally keeping short-lived effects."""
+
         if self.aircraft_entity is not None:
             destroy(self.aircraft_entity)
             self.aircraft_entity = None
         for entity in self.crew_entities.values():
             destroy(entity)
         self.crew_entities.clear()
-        for entity, _ in self._effects:
+        for entity in self.missile_entities.values():
             destroy(entity)
-        self._effects.clear()
+        self.missile_entities.clear()
+        if clear_effects:
+            for entity, _ in self._effects:
+                destroy(entity)
+            self._effects.clear()
         self._dynamic_entities.clear()
 
     def clear_world(self) -> None:
@@ -311,20 +352,114 @@ class AirDefenseScene:
     def aircraft_is_visible(self, aircraft_entity: Optional[Entity]) -> bool:
         if aircraft_entity is None or not aircraft_entity.enabled:
             return False
-        hit = self.center_raycast(250.0, ignore=[self.player_controller])
-        if hit is None:
+        target_position = Vec3(*aircraft_entity.world_position)
+        origin = camera.world_position
+        offset = target_position - origin
+        distance = offset.length()
+        if distance <= 1e-6 or offset.normalized().dot(camera.forward) <= 0.0:
             return False
-        current = hit
-        while current is not None:
-            same_aircraft = (
-                current is aircraft_entity
-                or getattr(current, "aircraft_id", None)
-                == getattr(aircraft_entity, "aircraft_id", None)
+        try:
+            hit = raycast(
+                origin,
+                offset.normalized(),
+                distance=distance + 0.25,
+                traverse_target=ursina_scene,
+                ignore=[self.player_controller],
             )
-            if same_aircraft:
-                return True
-            current = getattr(current, "parent", None)
-        return False
+        except TypeError:
+            hit = raycast(
+                origin,
+                offset.normalized(),
+                distance=distance + 0.25,
+                traverse_target=ursina_scene,
+            )
+        return raycast_hit_matches_target(hit, aircraft_entity)
+
+    def project_aircraft_target(
+        self,
+        aircraft_entity: Optional[Entity] = None,
+    ) -> Optional[AircraftScreenTarget]:
+        """Project the target with aspect-safe pixel distance and a visible lock zone."""
+
+        entity = aircraft_entity if aircraft_entity is not None else self.aircraft_entity
+        if entity is None or not entity.enabled:
+            return None
+        try:
+            projected = entity.screen_position
+            hud_position = (float(projected.x), float(projected.y))
+            viewport_width, viewport_height = self.viewport_size()
+            aspect = max(1e-6, float(getattr(camera, "aspect_ratio", viewport_width / viewport_height)))
+            screen_position = (
+                (hud_position[0] * 2.0 / aspect + 1.0) * viewport_width * 0.5,
+                (hud_position[1] * 2.0 + 1.0) * viewport_height * 0.5,
+            )
+            visible = self.aircraft_is_visible(entity)
+            center_x = viewport_width * 0.5
+            center_y = viewport_height * 0.5
+            distance_from_center = ((screen_position[0] - center_x) ** 2 + (screen_position[1] - center_y) ** 2) ** 0.5
+            radius = self._projected_aircraft_radius(entity, viewport_width, viewport_height)
+            in_lock_zone = visible and is_inside_lock_zone(
+                screen_position,
+                viewport_width,
+                viewport_height,
+            )
+            return AircraftScreenTarget(
+                visible=visible,
+                screen_position=screen_position,
+                hud_position=hud_position,
+                screen_radius=radius,
+                distance_from_center=distance_from_center,
+                in_lock_zone=in_lock_zone,
+            )
+        except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def _projected_aircraft_radius(
+        self,
+        entity: Entity,
+        viewport_width: float,
+        viewport_height: float,
+    ) -> float:
+        distance = max(0.01, (Vec3(*entity.world_position) - camera.world_position).length())
+        world_radius = max(
+            0.5,
+            abs(float(getattr(entity, "scale_x", 1.0))),
+            abs(float(getattr(entity, "scale_y", 1.0))),
+            abs(float(getattr(entity, "scale_z", 1.0))),
+        ) * 0.5
+        fov = max(1.0, float(getattr(camera, "fov", config.CAMERA_DEFAULT_FOV)))
+        ui_radius = world_radius / (distance * tan(radians(fov) * 0.5) * 2.0)
+        # HUD scales are normalized to the viewport height, so cap them to a
+        # readable range regardless of resolution or target distance.
+        return clamp_screen_radius(ui_radius)
+
+    def apply_aircraft_aim_assist(
+        self,
+        target: Optional[AircraftScreenTarget],
+        delta_seconds: float,
+    ) -> None:
+        """Apply the small post-mouse correction to the active first-person camera."""
+
+        if target is None or self.player_controller is None or not target.visible:
+            return
+        origin = camera.world_position
+        target_entity = self.aircraft_entity
+        if target_entity is None:
+            return
+        target_direction = Vec3(*target_entity.world_position) - origin
+        if target_direction.length() <= 1e-6:
+            return
+        viewport_width, viewport_height = self.viewport_size()
+        corrected = apply_aim_assist(
+            tuple(float(value) for value in camera.forward),
+            tuple(float(value) for value in target_direction.normalized()),
+            scope_enabled=True,
+            target_visible=target.visible,
+            target_screen_distance=target.distance_from_center,
+            lock_zone_radius_pixels=lock_zone_radius(viewport_width, viewport_height),
+            delta_seconds=delta_seconds,
+        )
+        camera.look_in_direction(Vec3(*corrected))
 
     def crew_under_center(self, max_distance: float = 150.0) -> Optional[str]:
         hit = self.center_raycast(max_distance, ignore=[self.player_controller])
@@ -358,6 +493,7 @@ class AirDefenseScene:
         self.aircraft_entity.aircraft_type = aircraft.aircraft_type
         self.aircraft_entity.aircraft_health = aircraft.health
         self.aircraft_entity.aircraft_max_health = profile.max_health
+        self.aircraft_entity.look_in_direction(Vec3(*aircraft.forward))
         wing = Entity(
             parent=self.aircraft_entity,
             model="cube",
@@ -373,7 +509,48 @@ class AirDefenseScene:
             return
         self.aircraft_entity.position = aircraft.position
         self.aircraft_entity.aircraft_health = aircraft.health
-        self.aircraft_entity.look_at(Vec3(*config.AIRCRAFT_TARGET_POSITION))
+        self.aircraft_entity.look_in_direction(Vec3(*aircraft.forward))
+
+    def create_guided_missile(self, missile: GuidedMissile) -> Entity:
+        """Create the yellow elongated cuboid used for one valid anti-air shot."""
+
+        entity = Entity(
+            model="cube",
+            position=missile.position,
+            scale=(config.GUIDED_MISSILE_WIDTH, config.GUIDED_MISSILE_HEIGHT, config.GUIDED_MISSILE_LENGTH),
+            color=_rgb(config.YELLOW_RGB),
+        )
+        entity.missile_id = missile.id
+        entity.target_aircraft_id = missile.target_aircraft_id
+        entity.look_in_direction(Vec3(*missile.forward))
+        self.missile_entities[missile.id] = entity
+        self._dynamic_entities.append(entity)
+        return entity
+
+    def update_guided_missile(self, missile: GuidedMissile) -> None:
+        entity = self.missile_entities.get(missile.id)
+        if entity is None:
+            return
+        entity.position = missile.position
+        entity.look_in_direction(Vec3(*missile.forward))
+
+    def remove_guided_missile(self, missile_id: str, *, explode: bool = False) -> None:
+        entity = self.missile_entities.pop(missile_id, None)
+        if entity is None:
+            return
+        if explode:
+            explosion = Entity(
+                model="sphere",
+                position=entity.position,
+                scale=0.45,
+                color=_rgb(config.YELLOW_RGB),
+            )
+            self._effects.append((explosion, config.GUIDED_MISSILE_EXPLOSION_SECONDS))
+        try:
+            self._dynamic_entities.remove(entity)
+        except ValueError:
+            pass
+        destroy(entity)
 
     def remove_aircraft(self, *, crash: bool = False) -> None:
         if self.aircraft_entity is None:

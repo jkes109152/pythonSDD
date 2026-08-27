@@ -5,9 +5,10 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from ursina import Button, Entity, Text, camera, color
+from ursina.models.procedural.circle import Circle
 
 from . import config
-from .rules import lock_status_label
+from .rules import lock_status_label, tracking_ring_radius
 from .state import (
     AircraftType,
     FailureReason,
@@ -32,20 +33,51 @@ class GameHUD:
         self.game_over_root = Entity(parent=self.root, enabled=False)
 
         self.lock_frame = self._make_reticle(self.gameplay_root)
+        self.lock_ring = self._make_tracking_ring(self.gameplay_root)
         self.sniper_crosshair = self._make_crosshair(self.gameplay_root, 0.07)
         self.pistol_reticle = self._make_crosshair(self.gameplay_root, 0.035)
         self.scope_overlay = self._make_scope_overlay(self.gameplay_root)
         self.lock_frame.enabled = False
+        self.lock_ring.enabled = False
         self.sniper_crosshair.enabled = False
         self.pistol_reticle.enabled = False
         self.lock_label = Text(
             parent=self.gameplay_root,
             text="未鎖定",
             origin=(0, 0),
-            y=-0.09,
+            y=-0.12,
             scale=0.9,
             color=_rgb(config.WHITE_RGB),
         )
+        self.lock_percent_text = self._text(
+            self.gameplay_root,
+            "鎖定 0%",
+            x=0,
+            y=-0.155,
+            origin=(0, 0),
+            scale=0.68,
+            color=_rgb(config.WHITE_RGB),
+        )
+        self.lock_bar_background = Entity(
+            parent=self.gameplay_root,
+            model="quad",
+            x=0,
+            y=-0.19,
+            scale=(config.AA_LOCK_PROGRESS_BAR_WIDTH, config.AA_LOCK_PROGRESS_BAR_HEIGHT),
+            color=color.rgba32(20, 25, 30, 210),
+        )
+        self.lock_bar_fill = Entity(
+            parent=self.gameplay_root,
+            model="quad",
+            x=-config.AA_LOCK_PROGRESS_BAR_WIDTH / 2.0,
+            y=-0.19,
+            scale=(0.0, config.AA_LOCK_PROGRESS_BAR_HEIGHT),
+            origin=(-0.5, 0),
+            color=_rgb(config.RED_RGB),
+        )
+        self.lock_percent_text.enabled = False
+        self.lock_bar_background.enabled = False
+        self.lock_bar_fill.enabled = False
         self.health_text = self._text(self.gameplay_root, "生命值: 100", x=-0.86, y=0.45)
         self.city_text = self._text(self.gameplay_root, "城市耐久: 100", x=-0.86, y=0.405, scale=0.82)
         self.wave_text = self._text(self.gameplay_root, "第 1 波", x=0.72, y=0.39, scale=0.9)
@@ -112,10 +144,27 @@ class GameHUD:
     def _make_reticle(parent: Entity) -> Entity:
         root = Entity(parent=parent)
         line_color = _rgb(config.WHITE_RGB)
-        Entity(parent=root, model="quad", scale=(0.055, 0.003), y=0.0275, color=line_color)
-        Entity(parent=root, model="quad", scale=(0.055, 0.003), y=-0.0275, color=line_color)
-        Entity(parent=root, model="quad", scale=(0.003, 0.055), x=-0.0275, color=line_color)
-        Entity(parent=root, model="quad", scale=(0.003, 0.055), x=0.0275, color=line_color)
+        size = config.AA_LOCK_FRAME_SIZE
+        half = size / 2.0
+        thickness = 0.004
+        Entity(parent=root, model="quad", scale=(size, thickness), y=half, color=line_color)
+        Entity(parent=root, model="quad", scale=(size, thickness), y=-half, color=line_color)
+        Entity(parent=root, model="quad", scale=(thickness, size), x=-half, color=line_color)
+        Entity(parent=root, model="quad", scale=(thickness, size), x=half, color=line_color)
+        return root
+
+    @staticmethod
+    def _make_tracking_ring(parent: Entity) -> Entity:
+        """Build one continuous ordinary circle, without segmented tick marks."""
+
+        root = Entity(parent=parent, enabled=False)
+        root.model = Circle(
+            resolution=64,
+            radius=config.AA_LOCK_RING_ACQUISITION_RADIUS,
+            mode="line",
+            thickness=2.0,
+        )
+        root.color = _rgb(config.RED_RGB)
         return root
 
     @staticmethod
@@ -254,9 +303,22 @@ class GameHUD:
             f"擊倒敵人 {stats.enemies_defeated}  名"
         )
 
-    def update_lock(self, state: LockState, visible: bool, *, active: bool = True) -> None:
+    def update_lock(
+        self,
+        state: LockState,
+        visible: bool,
+        *,
+        active: bool = True,
+        progress: float = 0.0,
+        target_position: Optional[tuple[float, float]] = None,
+        target_radius: float = 0.008,
+    ) -> None:
         self.lock_frame.enabled = active
+        self.lock_ring.enabled = active and target_position is not None
         self.lock_label.enabled = active
+        self.lock_percent_text.enabled = active
+        self.lock_bar_background.enabled = active
+        self.lock_bar_fill.enabled = active
         if state == LockState.WHITE:
             tint = _rgb(config.WHITE_RGB)
         elif state == LockState.RED_TRACKING:
@@ -265,8 +327,25 @@ class GameHUD:
             tint = _rgb(config.GREEN_RGB)
         for child in self.lock_frame.children:
             child.color = tint
+        self.lock_ring.color = tint
         self.lock_label.text = lock_status_label(state)
         self.lock_label.color = _rgb(config.GREEN_RGB) if state == LockState.GREEN_READY else _rgb(config.WHITE_RGB)
+        clamped_progress = max(0.0, min(1.0, float(progress)))
+        self.lock_percent_text.text = f"鎖定 {clamped_progress * 100.0:.0f}%"
+        self.lock_percent_text.color = self.lock_label.color
+        self.lock_bar_fill.scale_x = config.AA_LOCK_PROGRESS_BAR_WIDTH * clamped_progress
+        self.lock_bar_fill.color = tint
+        if target_position is not None:
+            self.lock_ring.position = target_position
+            radius = tracking_ring_radius(
+                config.AA_LOCK_RING_ACQUISITION_RADIUS,
+                target_radius,
+                clamped_progress,
+                padding=config.AA_LOCK_RING_PADDING,
+            )
+            base_radius = max(1e-6, config.AA_LOCK_RING_ACQUISITION_RADIUS)
+            ratio = radius / base_radius
+            self.lock_ring.scale = (ratio, ratio, 1.0)
 
     def update_reticle(
         self,
@@ -274,14 +353,21 @@ class GameHUD:
         phase: GamePhase,
         *,
         scope_enabled: bool = False,
+        anti_air_scope_enabled: bool = False,
     ) -> None:
         """Show exactly one weapon reticle family for the active phase/slot."""
 
-        anti_air_active = phase == GamePhase.AIRSTRIKE and weapon == WeaponKind.ANTI_AIRCRAFT
+        anti_air_equipped = (
+            phase == GamePhase.AIRSTRIKE
+            and weapon == WeaponKind.ANTI_AIRCRAFT
+        )
+        anti_air_scope_active = anti_air_equipped and anti_air_scope_enabled
         sniper_active = phase == GamePhase.GROUND_COMBAT and weapon == WeaponKind.SNIPER
         pistol_active = phase == GamePhase.GROUND_COMBAT and weapon == WeaponKind.PISTOL
-        self.lock_frame.enabled = anti_air_active
-        self.lock_label.enabled = anti_air_active
+        # The enlarged fixed frame remains visible while the anti-air weapon
+        # is equipped; dynamic lock feedback is scope-only.
+        self.lock_frame.enabled = anti_air_equipped
+        self.lock_label.enabled = anti_air_scope_active
         self.sniper_crosshair.enabled = sniper_active
         self.pistol_reticle.enabled = pistol_active
         self.scope_overlay.enabled = sniper_active and scope_enabled
@@ -297,6 +383,12 @@ class GameHUD:
         prompt: str = "",
         hit_feedback: str = "",
         scope_enabled: bool = False,
+        anti_air_scope_enabled: bool = False,
+        lock_state: LockState = LockState.WHITE,
+        lock_visible: bool = True,
+        lock_progress: float = 0.0,
+        lock_target_position: Optional[tuple[float, float]] = None,
+        lock_target_radius: float = 0.008,
         fps: Optional[float] = None,
         wave_number: Optional[int] = None,
         aircraft_index: Optional[int] = None,
@@ -341,7 +433,20 @@ class GameHUD:
         self.hit_text.text = hit_feedback
         self.scope_text.text = "狙擊瞄準：右鍵關閉" if scope_enabled else ""
         self.update_boss_health(boss_health, boss_max_health, label=boss_label)
-        self.update_reticle(weapon, phase, scope_enabled=scope_enabled)
+        self.update_lock(
+            lock_state,
+            lock_visible,
+            active=anti_air_scope_enabled and phase == GamePhase.AIRSTRIKE and weapon == WeaponKind.ANTI_AIRCRAFT,
+            progress=lock_progress,
+            target_position=lock_target_position,
+            target_radius=lock_target_radius,
+        )
+        self.update_reticle(
+            weapon,
+            phase,
+            scope_enabled=scope_enabled,
+            anti_air_scope_enabled=anti_air_scope_enabled,
+        )
 
     def update_boss_health(
         self,
