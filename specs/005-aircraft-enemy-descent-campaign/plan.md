@@ -280,7 +280,7 @@ tests/
 - Ursina construction／start-wave smoke 通過，包含 wave 1 啟動、單架飛機擊落、deterministic drop batch 建立與一次更新；未觀察到 import 或 attribute error。
 - 使用者已回報人工功能驗收完成且未發現問題；本輪未取得 SC-001 至 SC-009 的逐項 sample count 或 FPS 原始量測，因此不宣稱那些數值門檻已完成量測。
 - 本地 code review 已修正 source-drop completion guard、aggregate counter double count、stale aircraft scene reference、authoritative roster type lookup 與 no-target sniper cooldown 問題；`git diff --check` 通過。
-- 文件狀態為 Ready for Review。依憲章，PR 必須以 `main` 為 base；PR 合併並確認 merge commit 存在於 `main` 後，才可清理功能分支。正式 Release 仍以使用者確認的 semver 版本號為前置條件。
+- PR #5 已以 `main` 為 base 合併，merge commit `660af80` 已在本地與遠端 `main` 驗證；遠端與本地 `005-aircraft-enemy-descent-campaign` 功能分支也已依憲章清除，且保留 unrelated working-tree changes。文件狀態已更新為 Implemented；正式 Release 仍以使用者確認的 semver 版本號為前置條件。
 
 ## Complexity Tracking
 

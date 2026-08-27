@@ -4,7 +4,7 @@
 
 **Created**: 2026-08-27
 
-**Status**: Ready for Review
+**Status**: Implemented
 
 **Input**: User description: "飛機被擊落後，若該飛機有敵人，敵人要從飛機被擊落的位置緩慢降落；降落期間玩家可以攻擊敵人。遊戲採用混合空戰與地面戰，並依照確認的 18 波配置進行，最後一波完成後顯示勝利。"
 

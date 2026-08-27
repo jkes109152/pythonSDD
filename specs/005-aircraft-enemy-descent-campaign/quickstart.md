@@ -96,8 +96,8 @@ If a GUI or real-time measurement is unavailable, mark the affected criterion as
 
 ## Delivery status (2026-08-27)
 
-- Feature documents have been audited against the implementation and the project constitution; the feature is marked Ready for Review on branch `005-aircraft-enemy-descent-campaign`.
-- The required PR target is `main`. After merge, verify the merge commit on `main` before deleting the remote and local feature branches; preserve unrelated `day2/prj06.py` and `output/` changes.
+- Feature documents have been audited against the implementation and the project constitution; the feature is marked Implemented after GitHub PR #5 was merged into `main`.
+- Merge commit `660af80` was verified on local and remote `main`, then the remote and local `005-aircraft-enemy-descent-campaign` branches were deleted. Unrelated `day2/prj06.py` and `output/` changes were preserved.
 - No formal Release has been created yet. The constitution requires an explicit semver version before creating a tag and GitHub Release from verified `main`.
 
 ## Performance evidence

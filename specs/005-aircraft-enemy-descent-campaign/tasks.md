@@ -134,9 +134,9 @@ description: "依照固定 18 波、混合戰鬥與降落敵人規格的實作�
 
 **Purpose**: 依專案憲章完成 review、PR、merge verification、分支清理與正式 Release 的前置治理；Release 只能從已合併且驗證的 `main` 建立，且必須先確認明確 semver 版本號。
 
-- [ ] T037 在 `specs/005-aircraft-enemy-descent-campaign/spec.md`、`specs/005-aircraft-enemy-descent-campaign/plan.md`、`specs/005-aircraft-enemy-descent-campaign/tasks.md` 與 `specs/005-aircraft-enemy-descent-campaign/quickstart.md` 核對驗證結果與已知限制，推送 `005-aircraft-enemy-descent-campaign` 並建立 base=`main` 的 PR。
-- [ ] T038 在 `specs/005-aircraft-enemy-descent-campaign/spec.md`、`specs/005-aircraft-enemy-descent-campaign/plan.md`、`specs/005-aircraft-enemy-descent-campaign/tasks.md`、`specs/005-aircraft-enemy-descent-campaign/quickstart.md`、`air_defense/main.py`、`air_defense/rules.py`、`tests/test_rules.py` 與 `tests/test_game_lifecycle.py` 上完成 code review、compileall、自動化測試與必要手動驗證；將 review 結果、對應文件與限制寫入 PR。（本地 review、compileall、106 項測試與 Ursina smoke 已完成；PR 紀錄待 T037 建立 PR 後補上。）
-- [ ] T039 PR 合併後先確認合併 commit 已存在於 `main`，再刪除遠端與本地 `005-aircraft-enemy-descent-campaign` 分支；清理時保留 `day2/prj06.py` 與 `output/` 下不屬於本功能的工作區變更。
+- [X] T037 在 `specs/005-aircraft-enemy-descent-campaign/spec.md`、`specs/005-aircraft-enemy-descent-campaign/plan.md`、`specs/005-aircraft-enemy-descent-campaign/tasks.md` 與 `specs/005-aircraft-enemy-descent-campaign/quickstart.md` 核對驗證結果與已知限制，推送 `005-aircraft-enemy-descent-campaign` 並建立 base=`main` 的 PR。（已建立並合併 GitHub PR #5。）
+- [X] T038 在 `specs/005-aircraft-enemy-descent-campaign/spec.md`、`specs/005-aircraft-enemy-descent-campaign/plan.md`、`specs/005-aircraft-enemy-descent-campaign/tasks.md`、`specs/005-aircraft-enemy-descent-campaign/quickstart.md`、`air_defense/main.py`、`air_defense/rules.py`、`tests/test_rules.py` 與 `tests/test_game_lifecycle.py` 上完成 code review、compileall、自動化測試與必要手動驗證；將 review 結果、對應文件與限制寫入 PR。（本地 review、compileall、106 項測試、Ursina smoke 與使用者人工驗收已完成，結果已寫入 PR #5。）
+- [X] T039 PR 合併後先確認合併 commit 已存在於 `main`，再刪除遠端與本地 `005-aircraft-enemy-descent-campaign` 分支；清理時保留 `day2/prj06.py` 與 `output/` 下不屬於本功能的工作區變更。（已確認 merge commit `660af80` 位於 `main`，並完成遠端／本地功能分支清除。）
 - [ ] T040 在使用者確認明確 semver 版本號後，從已合併且驗證的 `main` 建立 annotated tag、推送 tag 並建立 GitHub Release；若版本號尚未確認，保留未完成並記錄此治理限制，不得先建立正式 Release。
 
 ---
