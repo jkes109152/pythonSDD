@@ -8,7 +8,14 @@ from ursina import Button, Entity, Text, camera, color
 
 from . import config
 from .rules import lock_status_label
-from .state import FailureReason, GamePhase, LockState, SessionStats, WeaponKind
+from .state import (
+    AircraftType,
+    FailureReason,
+    GamePhase,
+    LockState,
+    SessionStats,
+    WeaponKind,
+)
 
 
 def _rgb(values: tuple[float, float, float]):
@@ -25,6 +32,12 @@ class GameHUD:
         self.game_over_root = Entity(parent=self.root, enabled=False)
 
         self.lock_frame = self._make_reticle(self.gameplay_root)
+        self.sniper_crosshair = self._make_crosshair(self.gameplay_root, 0.07)
+        self.pistol_reticle = self._make_crosshair(self.gameplay_root, 0.035)
+        self.scope_overlay = self._make_scope_overlay(self.gameplay_root)
+        self.lock_frame.enabled = False
+        self.sniper_crosshair.enabled = False
+        self.pistol_reticle.enabled = False
         self.lock_label = Text(
             parent=self.gameplay_root,
             text="未鎖定",
@@ -34,6 +47,19 @@ class GameHUD:
             color=_rgb(config.WHITE_RGB),
         )
         self.health_text = self._text(self.gameplay_root, "生命值: 100", x=-0.86, y=0.45)
+        self.city_text = self._text(self.gameplay_root, "城市耐久: 100", x=-0.86, y=0.405, scale=0.82)
+        self.wave_text = self._text(self.gameplay_root, "第 1 波", x=0.72, y=0.39, scale=0.9)
+        self.progress_text = self._text(self.gameplay_root, "敵機 -- / --", x=0.72, y=0.345, scale=0.78)
+        self.aircraft_type_text = self._text(self.gameplay_root, "敵機: --", x=0.72, y=0.305, scale=0.75)
+        self.boss_health_text = self._text(
+            self.gameplay_root,
+            "",
+            x=0,
+            y=0.27,
+            origin=(0, 0),
+            scale=1.0,
+            color=_rgb(config.ORANGE_RGB),
+        )
         self.stats_text = self._text(self.gameplay_root, "", x=-0.86, y=0.39, scale=0.85)
         self.fps_text = self._text(self.gameplay_root, "", x=0.72, y=0.45, scale=0.75)
         self.weapon_text = self._text(self.gameplay_root, "武器: 空手", x=-0.86, y=-0.43, scale=0.95)
@@ -92,8 +118,28 @@ class GameHUD:
         Entity(parent=root, model="quad", scale=(0.003, 0.055), x=0.0275, color=line_color)
         return root
 
+    @staticmethod
+    def _make_crosshair(parent: Entity, size: float) -> Entity:
+        root = Entity(parent=parent)
+        line_color = _rgb(config.CYAN_RGB)
+        Entity(parent=root, model="quad", scale=(size, 0.0025), color=line_color)
+        Entity(parent=root, model="quad", scale=(0.0025, size), color=line_color)
+        Entity(parent=root, model="quad", scale=(0.008, 0.008), color=line_color)
+        root.enabled = False
+        return root
+
+    @staticmethod
+    def _make_scope_overlay(parent: Entity) -> Entity:
+        root = Entity(parent=parent, enabled=False)
+        overlay_color = color.rgba32(0, 0, 0, 220)
+        Entity(parent=root, model="quad", scale=(2.0, 0.08), y=0.46, color=overlay_color)
+        Entity(parent=root, model="quad", scale=(2.0, 0.08), y=-0.46, color=overlay_color)
+        Entity(parent=root, model="quad", scale=(0.08, 0.86), x=-0.96, color=overlay_color)
+        Entity(parent=root, model="quad", scale=(0.08, 0.86), x=0.96, color=overlay_color)
+        return root
+
     def _build_inventory(self) -> dict[WeaponKind, dict[str, Entity | Text]]:
-        """Build the always-visible two-slot weapon inventory bar."""
+        """Build the always-visible three-slot weapon inventory bar."""
 
         Text(
             parent=self.gameplay_root,
@@ -106,15 +152,16 @@ class GameHUD:
         )
         slots: dict[WeaponKind, dict[str, Entity | Text]] = {}
         slot_specs = (
-            (WeaponKind.ANTI_AIRCRAFT, "1", "防空炮", -0.105),
-            (WeaponKind.SNIPER, "2", "狙擊槍", 0.105),
+            (WeaponKind.ANTI_AIRCRAFT, "1", "防空炮", -0.21),
+            (WeaponKind.SNIPER, "2", "狙擊槍", 0.0),
+            (WeaponKind.PISTOL, "3", "手槍", 0.21),
         )
         for kind, key_label, item_label, x_position in slot_specs:
             root = Entity(parent=self.gameplay_root, x=x_position, y=-0.45)
             panel = Entity(
                 parent=root,
                 model="quad",
-                scale=(0.19, 0.085),
+                scale=(0.18, 0.085),
                 color=color.rgba32(28, 34, 46, 230),
             )
             key_text = Text(
@@ -198,6 +245,7 @@ class GameHUD:
         reason = {
             FailureReason.BUILDING_IMPACT: "飛機撞擊大樓",
             FailureReason.PLAYER_DEAD: "玩家生命值歸零",
+            FailureReason.CITY_DESTROYED: "城市被摧毀",
         }.get(stats.failure_reason, "防守失敗")
         self.failure_text.text = reason
         self.final_stats_text.text = (
@@ -206,7 +254,9 @@ class GameHUD:
             f"擊倒敵人 {stats.enemies_defeated}  名"
         )
 
-    def update_lock(self, state: LockState, visible: bool) -> None:
+    def update_lock(self, state: LockState, visible: bool, *, active: bool = True) -> None:
+        self.lock_frame.enabled = active
+        self.lock_label.enabled = active
         if state == LockState.WHITE:
             tint = _rgb(config.WHITE_RGB)
         elif state == LockState.RED_TRACKING:
@@ -217,6 +267,24 @@ class GameHUD:
             child.color = tint
         self.lock_label.text = lock_status_label(state)
         self.lock_label.color = _rgb(config.GREEN_RGB) if state == LockState.GREEN_READY else _rgb(config.WHITE_RGB)
+
+    def update_reticle(
+        self,
+        weapon: Optional[WeaponKind],
+        phase: GamePhase,
+        *,
+        scope_enabled: bool = False,
+    ) -> None:
+        """Show exactly one weapon reticle family for the active phase/slot."""
+
+        anti_air_active = phase == GamePhase.AIRSTRIKE and weapon == WeaponKind.ANTI_AIRCRAFT
+        sniper_active = phase == GamePhase.GROUND_COMBAT and weapon == WeaponKind.SNIPER
+        pistol_active = phase == GamePhase.GROUND_COMBAT and weapon == WeaponKind.PISTOL
+        self.lock_frame.enabled = anti_air_active
+        self.lock_label.enabled = anti_air_active
+        self.sniper_crosshair.enabled = sniper_active
+        self.pistol_reticle.enabled = pistol_active
+        self.scope_overlay.enabled = sniper_active and scope_enabled
 
     def update_session(
         self,
@@ -230,13 +298,36 @@ class GameHUD:
         hit_feedback: str = "",
         scope_enabled: bool = False,
         fps: Optional[float] = None,
+        wave_number: Optional[int] = None,
+        aircraft_index: Optional[int] = None,
+        aircraft_count: Optional[int] = None,
+        aircraft_type: Optional[AircraftType] = None,
+        city_health: Optional[float] = None,
+        boss_health: Optional[int] = None,
+        boss_max_health: Optional[int] = None,
+        boss_label: Optional[str] = None,
     ) -> None:
         weapon_name = {
             None: "空手",
             WeaponKind.ANTI_AIRCRAFT: "防空炮",
             WeaponKind.SNIPER: "狙擊槍",
+            WeaponKind.PISTOL: "手槍",
         }[weapon]
         self.health_text.text = f"生命值: {health} / {config.PLAYER_MAX_HEALTH}"
+        if city_health is not None:
+            self.city_text.text = f"城市耐久: {max(0.0, city_health):.0f} / {config.CITY_MAX_HEALTH}"
+        if wave_number is not None:
+            self.wave_text.text = f"第 {wave_number} 波"
+        if aircraft_index is not None and aircraft_count is not None:
+            self.progress_text.text = f"敵機 {aircraft_index + 1} / {aircraft_count}"
+        if aircraft_type is not None:
+            type_name = {
+                AircraftType.NORMAL: "普通",
+                AircraftType.MANPOWER_SUPPORT: "人力支援",
+                AircraftType.FAST: "快速",
+                AircraftType.ARMORED_BOSS: "裝甲 Boss",
+            }[AircraftType(aircraft_type)]
+            self.aircraft_type_text.text = f"敵機: {type_name}"
         self.stats_text.text = (
             f"存活 {stats.survival_seconds:05.1f}s  "
             f"擊落 {stats.aircraft_destroyed}  "
@@ -249,6 +340,20 @@ class GameHUD:
         self.prompt_text.text = prompt
         self.hit_text.text = hit_feedback
         self.scope_text.text = "狙擊瞄準：右鍵關閉" if scope_enabled else ""
+        self.update_boss_health(boss_health, boss_max_health, label=boss_label)
+        self.update_reticle(weapon, phase, scope_enabled=scope_enabled)
+
+    def update_boss_health(
+        self,
+        current: Optional[int],
+        maximum: Optional[int],
+        *,
+        label: Optional[str] = None,
+    ) -> None:
+        if current is None or maximum is None:
+            self.boss_health_text.text = ""
+            return
+        self.boss_health_text.text = f"{label or 'Boss HP'}: {current} / {maximum}"
 
     def update_inventory(
         self,
@@ -260,7 +365,10 @@ class GameHUD:
         for kind, slot in self.inventory_slots.items():
             usable = (
                 kind == WeaponKind.ANTI_AIRCRAFT and phase == GamePhase.AIRSTRIKE
-            ) or (kind == WeaponKind.SNIPER and phase == GamePhase.GROUND_COMBAT)
+            ) or (
+                kind in (WeaponKind.SNIPER, WeaponKind.PISTOL)
+                and phase == GamePhase.GROUND_COMBAT
+            )
             selected = kind == selected_weapon
             panel = slot["panel"]
             key_text = slot["key"]

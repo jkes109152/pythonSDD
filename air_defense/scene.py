@@ -16,6 +16,8 @@ from ursina.prefabs.first_person_controller import FirstPersonController
 
 from . import config
 from .entities import Aircraft, GroundEncounter
+from .rules import aircraft_profile
+from .state import AircraftType
 
 
 def _rgb(values: tuple[float, float, float]):
@@ -31,10 +33,11 @@ class WorldHandles:
     anti_aircraft_pickup: Entity
     sniper_pickup: Entity
     cover_nodes: dict[str, Entity]
+    obstacles: tuple[Entity, ...] = ()
 
 
 class AirDefenseScene:
-    """Creates and cleans the one small city-block scene."""
+    """Creates the long plain, collidable cover route and visual adapters."""
 
     def __init__(self) -> None:
         self.asset_root = Path(__file__).resolve().parents[1] / "assets" / "air_defense"
@@ -71,7 +74,8 @@ class AirDefenseScene:
 
         ground = Entity(
             model="plane",
-            scale=(config.GROUND_SIZE, 1, config.GROUND_SIZE),
+            position=config.GROUND_CENTER,
+            scale=(config.MAP_WIDTH, 1, config.MAP_LENGTH),
             color=_rgb((0.28, 0.38, 0.25)),
             collider="box",
         )
@@ -80,13 +84,13 @@ class AirDefenseScene:
         road = Entity(
             model="cube",
             position=(0, 0.015, 8),
-            scale=(config.GROUND_SIZE, 0.03, 5),
+            scale=(config.MAP_WIDTH, 0.03, 5),
             color=_rgb((0.16, 0.17, 0.19)),
         )
         crossroad = Entity(
             model="cube",
             position=(0, 0.02, -2),
-            scale=(5, 0.035, config.GROUND_SIZE),
+            scale=(5, 0.035, config.MAP_LENGTH),
             color=_rgb((0.16, 0.17, 0.19)),
         )
         self._static_entities.extend((road, crossroad))
@@ -116,22 +120,18 @@ class AirDefenseScene:
         )
         self._static_entities.append(crash_site)
 
-        small_buildings = (
-            ((17, 2, -3), (7, 4, 7), (0.62, 0.48, 0.38)),
-            ((-18, 3, -4), (7, 6, 8), (0.52, 0.42, 0.55)),
-            ((18, 2, 19), (8, 4, 6), (0.42, 0.58, 0.52)),
-            ((-18, 2, 23), (8, 4, 6), (0.58, 0.5, 0.34)),
-        )
-        for position, scale, tint in small_buildings:
-            self._static_entities.append(
-                Entity(
-                    model="cube",
-                    position=position,
-                    scale=scale,
-                    color=_rgb(tint),
-                    collider="box",
-                )
+        obstacles: list[Entity] = []
+        for position, scale, tint in config.OBSTACLE_LAYOUT:
+            obstacle = Entity(
+                model="cube",
+                position=position,
+                scale=scale,
+                color=_rgb(tint),
+                collider="box",
             )
+            obstacle.obstacle_id = f"obstacle-{len(obstacles) + 1:02d}"
+            obstacles.append(obstacle)
+        self._static_entities.extend(obstacles)
 
         rack_position = config.WEAPON_RACK_POSITION
         weapon_rack = Entity(
@@ -173,18 +173,13 @@ class AirDefenseScene:
         sniper_pickup.enabled = False
         self._static_entities.extend((anti_aircraft_pickup, sniper_pickup))
 
-        cover_positions = {
-            "cover-north": (-6, 0.8, 2),
-            "cover-east": (7, 0.8, 4),
-            "cover-south": (8, 0.8, 12),
-            "cover-west": (-4, 0.8, 16),
-        }
         cover_nodes: dict[str, Entity] = {}
-        for node_id, position in cover_positions.items():
+        for node_id, route_position in config.COVER_NODE_POSITIONS.items():
+            position = (route_position[0], 0.8, route_position[2])
             node = Entity(
                 model="cube",
                 position=position,
-                scale=(2.2, 1.6, 0.8),
+                scale=(2.8, 1.6, 1.2),
                 color=_rgb((0.34, 0.34, 0.38)),
                 collider="box",
             )
@@ -200,6 +195,7 @@ class AirDefenseScene:
             anti_aircraft_pickup=anti_aircraft_pickup,
             sniper_pickup=sniper_pickup,
             cover_nodes=cover_nodes,
+            obstacles=tuple(obstacles),
         )
         self._create_player()
         return self.world
@@ -222,6 +218,11 @@ class AirDefenseScene:
             self.player_controller.enabled = enabled
             self.player_controller.cursor.visible = False
 
+    def set_scope_enabled(self, enabled: bool) -> None:
+        """Bridge the sniper scope state to the actual camera field of view."""
+
+        camera.fov = config.CAMERA_SCOPE_FOV if enabled else config.CAMERA_DEFAULT_FOV
+
     def clear_dynamic(self) -> None:
         if self.aircraft_entity is not None:
             destroy(self.aircraft_entity)
@@ -236,6 +237,7 @@ class AirDefenseScene:
 
     def clear_world(self) -> None:
         self.clear_dynamic()
+        self.set_scope_enabled(False)
         if self.player_controller is not None:
             destroy(self.player_controller)
             self.player_controller = None
@@ -335,20 +337,31 @@ class AirDefenseScene:
         return None
 
     def create_aircraft(self, aircraft: Aircraft) -> Entity:
+        profile = aircraft_profile(aircraft.aircraft_type)
+        tint = {
+            AircraftType.NORMAL: (0.82, 0.25, 0.18),
+            AircraftType.MANPOWER_SUPPORT: (0.86, 0.55, 0.14),
+            AircraftType.FAST: (0.28, 0.62, 0.92),
+            AircraftType.ARMORED_BOSS: (0.62, 0.18, 0.68),
+        }[aircraft.aircraft_type]
+        scale = (1.9, 0.6, 3.2) if aircraft.aircraft_type == AircraftType.ARMORED_BOSS else (1.6, 0.45, 2.8)
         self.aircraft_entity = self.create_optional_model(
             "aircraft.glb",
             fallback_model="cube",
             position=aircraft.position,
-            scale=(1.6, 0.45, 2.8),
+            scale=scale,
             rotation=(12, 0, 0),
-            color=_rgb((0.82, 0.25, 0.18)),
+            color=_rgb(tint),
             collider="box",
         )
         self.aircraft_entity.aircraft_id = aircraft.id
+        self.aircraft_entity.aircraft_type = aircraft.aircraft_type
+        self.aircraft_entity.aircraft_health = aircraft.health
+        self.aircraft_entity.aircraft_max_health = profile.max_health
         wing = Entity(
             parent=self.aircraft_entity,
             model="cube",
-            scale=(3.0, 0.08, 0.65),
+            scale=(3.6, 0.08, 0.75) if aircraft.aircraft_type == AircraftType.ARMORED_BOSS else (3.0, 0.08, 0.65),
             y=0.02,
             color=_rgb((0.25, 0.28, 0.35)),
         )
@@ -359,7 +372,8 @@ class AirDefenseScene:
         if self.aircraft_entity is None:
             return
         self.aircraft_entity.position = aircraft.position
-        self.aircraft_entity.look_at(Vec3(*config.BUILDING_POSITION))
+        self.aircraft_entity.aircraft_health = aircraft.health
+        self.aircraft_entity.look_at(Vec3(*config.AIRCRAFT_TARGET_POSITION))
 
     def remove_aircraft(self, *, crash: bool = False) -> None:
         if self.aircraft_entity is None:
@@ -379,17 +393,17 @@ class AirDefenseScene:
         if self.world is None:
             return
         for member in encounter.crew:
-            cover = self.world.cover_nodes.get(member.cover_node)
-            position = cover.world_position if cover else Vec3(0, 1, 4)
+            tint = (0.55, 0.12, 0.7) if member.is_boss else (0.72, 0.18, 0.16)
             entity = self.create_optional_model(
                 "crew.glb",
                 fallback_model="cube",
-                position=position + Vec3(0, 0.9, 0),
-                scale=(0.65, 1.8, 0.65),
-                color=_rgb((0.72, 0.18, 0.16)),
+                position=Vec3(*member.position) + Vec3(0, 0.9, 0),
+                scale=(0.9, 2.4, 0.9) if member.is_boss else (0.65, 1.8, 0.65),
+                color=_rgb(tint),
                 collider="box",
             )
             entity.crew_id = member.id
+            entity.is_boss = member.is_boss
             head = Entity(
                 parent=entity,
                 model="sphere",
@@ -408,9 +422,8 @@ class AirDefenseScene:
             if entity is None:
                 continue
             entity.enabled = member.alive
-            cover = self.world.cover_nodes.get(member.cover_node)
-            if cover is not None and member.alive:
-                entity.position = cover.world_position + Vec3(0, 0.9, 0)
+            if member.alive:
+                entity.position = Vec3(*member.position) + Vec3(0, 0.9, 0)
 
     def remove_crew_member(self, crew_id: str) -> None:
         entity = self.crew_entities.pop(crew_id, None)
