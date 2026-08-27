@@ -30,6 +30,7 @@ htmlcov/
 .ruff_cache/
 .tox/
 .nox/
+Panda3D-1.10/
 
 # IDE and editor settings
 .idea/
