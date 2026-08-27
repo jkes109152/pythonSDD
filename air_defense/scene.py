@@ -16,7 +16,7 @@ from ursina import Entity, Vec3, camera, color, destroy, raycast, scene as ursin
 from ursina.prefabs.first_person_controller import FirstPersonController
 
 from . import config
-from .entities import Aircraft, GroundEncounter, GroundTracerEffect, GuidedMissile
+from .entities import Aircraft, CrewMember, GroundEncounter, GroundTracerEffect, GuidedMissile
 from .rules import (
     aircraft_profile,
     apply_aim_assist,
@@ -567,6 +567,8 @@ class AirDefenseScene:
         old_entity = self.aircraft_entities.pop(aircraft.id, None)
         if old_entity is not None:
             self._forget_dynamic_entity_refs(old_entity)
+            if self.aircraft_entity is old_entity:
+                self.aircraft_entity = None
             destroy(old_entity)
         entity = self.create_optional_model(
             "aircraft.glb",
@@ -672,9 +674,20 @@ class AirDefenseScene:
             self.aircraft_entity = next(iter(self.aircraft_entities.values()), None)
 
     def create_crew(self, encounter: GroundEncounter) -> None:
+        self.create_crew_members(encounter.crew)
+
+    def create_crew_members(self, members: Iterable[CrewMember]) -> None:
+        """Create only missing crew colliders for an immediate drop batch."""
+
         if self.world is None:
             return
-        for member in encounter.crew:
+        for member in members:
+            if member.id in self.crew_entities:
+                entity = self.crew_entities[member.id]
+                entity.enabled = member.alive
+                if member.alive:
+                    entity.position = Vec3(*member.position) + Vec3(0, 0.9, 0)
+                continue
             tint = (0.55, 0.12, 0.7) if member.is_boss else (0.72, 0.18, 0.16)
             entity = self.create_optional_model(
                 "crew.glb",

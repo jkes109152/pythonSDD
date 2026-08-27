@@ -433,11 +433,37 @@ class GroundTracerEffect:
 
 
 @dataclass
+class BatchProgress:
+    """Mutable source-scoped counters owned by one ground encounter."""
+
+    source_aircraft_id: str
+    spawned_count: int = 0
+    alive_count: int = 0
+    cleared_count: int = 0
+
+    def __post_init__(self) -> None:
+        self.source_aircraft_id = str(self.source_aircraft_id)
+        self.spawned_count = max(0, int(self.spawned_count))
+        self.alive_count = max(0, int(self.alive_count))
+        self.cleared_count = max(0, int(self.cleared_count))
+        if self.spawned_count != self.alive_count + self.cleared_count:
+            raise ValueError("spawned_count must equal alive_count + cleared_count")
+
+
+class BatchProgressLedger(dict[str, BatchProgress]):
+    """Dictionary view that also supports the documented lookup call syntax."""
+
+    def __call__(self, source_aircraft_id: str) -> Optional[BatchProgress]:
+        return self.get(str(source_aircraft_id))
+
+
+@dataclass
 class CrewMember:
     id: str
     encounter_id: str
     cover_node: Optional[str]
     squad_role: SquadRole
+    source_aircraft_id: str = ""
     behavior_state: CrewBehaviorState = CrewBehaviorState.IN_COVER
     alive: bool = True
     attack_cooldown: float = config.CREW_ATTACK_COOLDOWN_SECONDS
@@ -452,8 +478,27 @@ class CrewMember:
     at_city: bool = False
     city_attack_elapsed: float = 0.0
     attack_sequence: int = 0
+    descent_start_position: tuple[float, float, float] = config.CRASH_SITE_POSITION
+    landing_position: tuple[float, float, float] = config.CRASH_SITE_POSITION
+    descent_elapsed: float = 0.0
+    descent_duration: float = config.CREW_DESCENT_DURATION_SECONDS
+    descent_offset: tuple[float, float] = (0.0, 0.0)
 
     def __post_init__(self) -> None:
+        self.id = str(self.id)
+        self.encounter_id = str(self.encounter_id)
+        self.source_aircraft_id = str(self.source_aircraft_id)
+        self.position = tuple(float(value) for value in self.position)
+        self.descent_start_position = tuple(
+            float(value) for value in self.descent_start_position
+        )
+        self.landing_position = tuple(float(value) for value in self.landing_position)
+        self.descent_duration = max(1e-6, float(self.descent_duration))
+        self.descent_elapsed = max(0.0, float(self.descent_elapsed))
+        self.descent_offset = (
+            float(self.descent_offset[0]),
+            float(self.descent_offset[1]),
+        )
         if self.is_boss:
             if self.max_health < config.GROUND_BOSS_HEALTH:
                 self.max_health = config.GROUND_BOSS_HEALTH
@@ -482,11 +527,58 @@ class CrewMember:
         self.at_city = False
         return True
 
+    def begin_descent(
+        self,
+        start_position: tuple[float, float, float],
+        landing_position: tuple[float, float, float],
+        duration: float = config.CREW_DESCENT_DURATION_SECONDS,
+        offset: tuple[float, float] = (0.0, 0.0),
+    ) -> bool:
+        """Start one guarded descent; dead members can never be revived."""
+
+        if not self.alive:
+            return False
+        self.descent_start_position = tuple(float(value) for value in start_position)
+        self.landing_position = tuple(float(value) for value in landing_position)
+        self.position = self.descent_start_position
+        self.descent_duration = max(1e-6, float(duration))
+        self.descent_elapsed = 0.0
+        self.descent_offset = (float(offset[0]), float(offset[1]))
+        self.behavior_state = CrewBehaviorState.DESCENDING
+        self.at_city = False
+        self.attack_cooldown = config.CREW_ATTACK_COOLDOWN_SECONDS
+        return True
+
+    def advance_descent(self, delta_seconds: float) -> bool:
+        """Linearly advance and report only the first transition to landed."""
+
+        if not self.alive or self.behavior_state != CrewBehaviorState.DESCENDING:
+            return False
+        self.descent_elapsed = min(
+            self.descent_duration,
+            self.descent_elapsed + max(0.0, float(delta_seconds)),
+        )
+        progress = min(1.0, self.descent_elapsed / self.descent_duration)
+        self.position = tuple(
+            self.descent_start_position[index]
+            + (self.landing_position[index] - self.descent_start_position[index]) * progress
+            for index in range(3)
+        )
+        if progress < 1.0:
+            return False
+        self.position = self.landing_position
+        self.behavior_state = CrewBehaviorState.IN_COVER
+        return True
+
     def update_attack_cooldown(self, delta_seconds: float) -> None:
         self.attack_cooldown = max(0.0, self.attack_cooldown - max(0.0, delta_seconds))
 
     def ready_to_attack(self) -> bool:
-        return self.alive and self.attack_cooldown <= 0.0
+        return (
+            self.alive
+            and self.behavior_state != CrewBehaviorState.DESCENDING
+            and self.attack_cooldown <= 0.0
+        )
 
     def mark_attacked(self) -> None:
         self.attack_cooldown = config.CREW_ATTACK_COOLDOWN_SECONDS
@@ -512,19 +604,93 @@ class GroundEncounter:
     city_damage_accumulator: float = 0.0
     source_aircraft_ids: tuple[str, ...] = ()
     group_id: Optional[str] = None
+    batch_progress: BatchProgressLedger = field(default_factory=BatchProgressLedger)
+    _cleared_member_ids: set[str] = field(default_factory=set, repr=False)
 
     def __post_init__(self) -> None:
-        self.crew_count = len(self.crew) if self.crew_count == 0 else self.crew_count
+        self.aircraft_id = str(self.aircraft_id)
+        self.crew = list(self.crew)
+        member_ids = [str(member.id) for member in self.crew]
+        if len(set(member_ids)) != len(member_ids):
+            raise ValueError("crew IDs must be unique within an encounter")
+        self.crew_count = len(self.crew)
         self.aircraft_type = AircraftType(self.aircraft_type)
         if not self.source_aircraft_ids:
-            self.source_aircraft_ids = (self.aircraft_id,)
+            inferred_sources = tuple(
+                dict.fromkeys(
+                    member.source_aircraft_id
+                    for member in self.crew
+                    if member.source_aircraft_id
+                )
+            )
+            self.source_aircraft_ids = inferred_sources or (
+                (self.aircraft_id,) if self.crew else ()
+            )
         else:
             self.source_aircraft_ids = tuple(str(item) for item in self.source_aircraft_ids)
+        if len(set(self.source_aircraft_ids)) != len(self.source_aircraft_ids):
+            raise ValueError("source aircraft IDs must be unique")
         if self.group_id is not None:
             self.group_id = str(self.group_id)
         if self.boss_id is None:
             boss = next((member for member in self.crew if member.is_boss), None)
             self.boss_id = boss.id if boss is not None else None
+        if self.boss_id is not None:
+            self.boss_id = str(self.boss_id)
+
+        supplied_progress = BatchProgressLedger(self.batch_progress)
+        self.batch_progress = BatchProgressLedger()
+        for key, progress in supplied_progress.items():
+            source_id = str(key)
+            if source_id != progress.source_aircraft_id:
+                raise ValueError("batch progress key must match source aircraft ID")
+            if source_id not in self.source_aircraft_ids:
+                raise ValueError("batch progress source must be registered")
+            self.batch_progress[source_id] = progress
+
+        observed_progress: BatchProgressLedger = BatchProgressLedger()
+        if not self.crew and self.source_aircraft_ids:
+            for source_id in self.source_aircraft_ids:
+                observed_progress[source_id] = BatchProgress(source_id)
+        for member in self.crew:
+            if not member.source_aircraft_id:
+                if len(self.source_aircraft_ids) == 1:
+                    member.source_aircraft_id = self.source_aircraft_ids[0]
+                else:
+                    raise ValueError("crew member source aircraft ID is required")
+            if member.source_aircraft_id not in self.source_aircraft_ids:
+                raise ValueError("crew member source aircraft ID must be registered")
+            if member.encounter_id != self.id:
+                raise ValueError("crew member encounter ID must match aggregate")
+            progress = observed_progress.setdefault(
+                member.source_aircraft_id,
+                BatchProgress(member.source_aircraft_id),
+            )
+            progress.spawned_count += 1
+            if member.alive:
+                progress.alive_count += 1
+            else:
+                progress.cleared_count += 1
+                self._cleared_member_ids.add(member.id)
+
+        for source_id, observed in observed_progress.items():
+            supplied = self.batch_progress.get(source_id)
+            if supplied is None:
+                self.batch_progress[source_id] = observed
+                continue
+            if (
+                supplied.spawned_count,
+                supplied.alive_count,
+                supplied.cleared_count,
+            ) != (
+                observed.spawned_count,
+                observed.alive_count,
+                observed.cleared_count,
+            ):
+                raise ValueError("batch progress counters do not match crew")
+        for progress in self.batch_progress.values():
+            if progress.spawned_count != progress.alive_count + progress.cleared_count:
+                raise ValueError("invalid batch progress counters")
         self.refresh_cleared()
 
     @property
@@ -542,5 +708,56 @@ class GroundEncounter:
         self.cleared = not self.alive_crew
         return self.cleared
 
-    def add_reinforcement(self, *_: object) -> bool:
-        return False
+    def add_reinforcement(
+        self,
+        members: list[CrewMember] | tuple[CrewMember, ...],
+        source_aircraft_id: str,
+    ) -> bool:
+        """Append one non-empty source batch without disturbing existing members."""
+
+        source_aircraft_id = str(source_aircraft_id)
+        batch = tuple(members)
+        if not batch or source_aircraft_id in self.source_aircraft_ids:
+            return False
+        existing_ids = {member.id for member in self.crew}
+        batch_ids = [member.id for member in batch]
+        if len(set(batch_ids)) != len(batch_ids) or existing_ids.intersection(batch_ids):
+            return False
+        if any(
+            member.encounter_id != self.id
+            or member.source_aircraft_id != source_aircraft_id
+            for member in batch
+        ):
+            return False
+        self.crew.extend(batch)
+        self.crew_count = len(self.crew)
+        self.source_aircraft_ids = self.source_aircraft_ids + (source_aircraft_id,)
+        progress = BatchProgress(
+            source_aircraft_id=source_aircraft_id,
+            spawned_count=len(batch),
+            alive_count=sum(1 for member in batch if member.alive),
+            cleared_count=sum(1 for member in batch if not member.alive),
+        )
+        self.batch_progress[source_aircraft_id] = progress
+        self._cleared_member_ids.update(member.id for member in batch if not member.alive)
+        if self.boss_id is None:
+            boss = next((member for member in batch if member.is_boss), None)
+            if boss is not None:
+                self.boss_id = boss.id
+        self.refresh_cleared()
+        return True
+
+    def record_crew_cleared(self, member_id: str) -> bool:
+        """Count one already-dead crew member once in its source batch."""
+
+        member = self.find(member_id)
+        if member is None or member.alive or member.id in self._cleared_member_ids:
+            return False
+        progress = self.batch_progress.get(member.source_aircraft_id)
+        if progress is None:
+            return False
+        self._cleared_member_ids.add(member.id)
+        progress.alive_count = max(0, progress.alive_count - 1)
+        progress.cleared_count += 1
+        self.refresh_cleared()
+        return True

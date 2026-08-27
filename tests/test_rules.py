@@ -11,8 +11,10 @@ from air_defense import config
 from air_defense.entities import (
     Aircraft,
     AntiAircraftGun,
+    BatchProgress,
     CrewMember,
     GuidedMissile,
+    GroundEncounter,
     MissileStep,
     Player,
     SniperRifle,
@@ -32,6 +34,7 @@ from air_defense.rules import (
     defeat_crew_member,
     drop_weapon,
     inventory_selection_allowed,
+    normalize_aircraft_token,
     lock_status_label,
     apply_city_damage,
     resolve_aircraft_outcome,
@@ -51,6 +54,7 @@ from air_defense.state import (
     SquadRole,
     WeaponKind,
     WaveProgress,
+    WavePlan,
     WaveRuntime,
 )
 
@@ -615,7 +619,7 @@ class WaveRuleTests(unittest.TestCase):
         self.assertEqual(second_aircraft.wave_number, 1)
         self.assertEqual(second_aircraft.aircraft_index, 1)
         self.assertEqual(next_wave.wave_number, 2)
-        self.assertEqual(next_wave.aircraft_count, 3)
+        self.assertEqual(next_wave.aircraft_count, 2)
         self.assertEqual(next_wave.aircraft_index, 0)
 
     def test_session_completes_same_wave_before_creating_the_next_wave(self) -> None:
@@ -648,18 +652,11 @@ class WaveRuleTests(unittest.TestCase):
 
         self.assertEqual(
             [plan.aircraft_count for plan in plans[:9]],
-            [2, 3, 4, 5, 6, 7, 8, 9, 10],
+            [2, 2, 2, 2, 3, 3, 3, 3, 3],
         )
-        self.assertEqual([plans[index].aircraft_cap for index in (4, 6, 8)], [6, 8, 10])
-        self.assertTrue(all(not plan.is_boss_wave for plan in plans[:9]))
-        self.assertTrue(
-            all(
-                aircraft_type != AircraftType.ARMORED_BOSS
-                for plan in plans[:9]
-                for aircraft_type in plan.roster
-            )
-        )
-        boss_plan = plans[9]
+        self.assertEqual([plans[index].aircraft_cap for index in (4, 6, 8)], [6, 6, 6])
+        self.assertTrue(any(plan.is_boss_wave for plan in plans[:9]))
+        boss_plan = plans[8]
         self.assertTrue(boss_plan.is_boss_wave)
         self.assertEqual(
             boss_plan.roster.count(AircraftType.ARMORED_BOSS),
@@ -690,6 +687,12 @@ class WaveRuleTests(unittest.TestCase):
         self.assertEqual(boss.crew_count, 1)
         self.assertTrue(boss.crew[0].is_boss)
         self.assertEqual(boss.crew[0].max_health, config.GROUND_BOSS_HEALTH)
+
+        string_typed = factory.create_for_aircraft(
+            "aircraft-string-type",
+            "MANPOWER_SUPPORT",
+        )
+        self.assertEqual(len(string_typed.crew), config.MANPOWER_SUPPORT_CREW)
 
     def test_encounter_factory_honors_custom_normal_crew_bounds(self) -> None:
         source = FixedRandom(0)
@@ -724,6 +727,311 @@ class WaveRuleTests(unittest.TestCase):
         self.assertEqual(len(source.calls), 1)
         self.assertEqual(len(encounter.crew), 2 + config.MANPOWER_SUPPORT_CREW)
         self.assertTrue(all(member.encounter_id == encounter.id for member in encounter.crew))
+
+
+class AircraftEnemyDescentRuleTests(unittest.TestCase):
+    def test_drop_and_clear_guards_reject_stale_or_illegal_events(self) -> None:
+        director = WaveDirector()
+        plan = director.plan_wave(1, aircraft_count=1, cap=1)
+        session = GameSession()
+        session.start_new_game(plan)
+        aircraft_id = "guarded-aircraft"
+        runtime = session.initialize_wave_runtime((aircraft_id,), {aircraft_id: plan.roster[0]})
+
+        self.assertFalse(runtime.mark_drop_spawned(aircraft_id))
+        self.assertTrue(session.mark_aircraft_destroyed(aircraft_id))
+        self.assertEqual(
+            session.transition(
+                SessionEvent.WAVE_CLEARED,
+                ground_cleared=True,
+            ),
+            GamePhase.AIRSTRIKE,
+        )
+        self.assertEqual(
+            session.transition(
+                SessionEvent.WAVE_CLEARED,
+                encounter_id="encounter:stale",
+            ),
+            GamePhase.AIRSTRIKE,
+        )
+        self.assertEqual(session.wave.wave_number, 1)
+        self.assertTrue(runtime.mark_drop_spawned(aircraft_id))
+
+        menu = GameSession(
+            phase=GamePhase.MAIN_MENU,
+            wave=plan.to_progress(),
+        )
+        menu.wave.wave_number = 18
+        menu_runtime = menu.initialize_wave_runtime(
+            ("menu-aircraft",),
+            {"menu-aircraft": plan.roster[0]},
+        )
+        self.assertTrue(menu_runtime.mark_destroyed("menu-aircraft"))
+        self.assertEqual(menu.transition(SessionEvent.VICTORY), GamePhase.MAIN_MENU)
+
+        legacy_final = GameSession()
+        legacy_final_plan = director.plan_wave(18, aircraft_count=1, cap=1)
+        legacy_final.start_new_game(legacy_final_plan)
+        self.assertEqual(
+            legacy_final.transition(SessionEvent.VICTORY, ground_cleared=True),
+            GamePhase.AIRSTRIKE,
+        )
+
+    def test_drop_and_wave_clear_events_are_keyed_and_final_is_idempotent(self) -> None:
+        director = WaveDirector()
+        session = GameSession()
+        plan = director.plan_wave(1, aircraft_count=2, cap=2)
+        session.start_new_game(plan)
+        ids = ("event-aircraft-1", "event-aircraft-2")
+        session.initialize_wave_runtime(ids, dict(zip(ids, plan.roster)))
+
+        self.assertTrue(session.mark_aircraft_destroyed(ids[0]))
+        self.assertEqual(
+            session.transition(
+                SessionEvent.DROP_STARTED,
+                event_id="drop-event-1",
+                aircraft_id=ids[0],
+                encounter_id="encounter:wave-1",
+            ),
+            GamePhase.HYBRID_COMBAT,
+        )
+        self.assertEqual(session.wave_runtime.drop_spawned_aircraft_ids, {ids[0]})
+        self.assertEqual(
+            session.transition(
+                SessionEvent.DROP_STARTED,
+                event_id="drop-event-1",
+                aircraft_id=ids[0],
+                encounter_id="encounter:wave-1",
+            ),
+            GamePhase.HYBRID_COMBAT,
+        )
+        self.assertEqual(
+            session.transition(SessionEvent.AIRCRAFT_DESTROYED, aircraft_id=ids[1]),
+            GamePhase.GROUND_COMBAT,
+        )
+
+        final = GameSession()
+        final_plan = director.plan_wave(18, aircraft_count=1, cap=1)
+        final.start_new_game(final_plan)
+        final_id = ("final-aircraft",)
+        final.initialize_wave_runtime(final_id, {final_id[0]: final_plan.roster[0]})
+        self.assertTrue(final.mark_aircraft_destroyed(final_id[0]))
+        self.assertTrue(final.wave_runtime.mark_drop_spawned(final_id[0]))
+        self.assertEqual(
+            final.transition(
+                SessionEvent.WAVE_CLEARED,
+                event_id="wave-cleared:18",
+            ),
+            GamePhase.VICTORY,
+        )
+        self.assertEqual(
+            final.transition(
+                SessionEvent.WAVE_CLEARED,
+                event_id="wave-cleared:18",
+            ),
+            GamePhase.VICTORY,
+        )
+        self.assertEqual(final.transition(SessionEvent.RETURN_TO_MENU), GamePhase.MAIN_MENU)
+
+    def test_keyed_crew_cleared_compatibility_event_cannot_bypass_aggregate_clear(self) -> None:
+        session = GameSession()
+        plan = WaveDirector().plan_wave(1, aircraft_count=1, cap=1)
+        session.start_new_game(plan)
+        aircraft_id = "keyed-aircraft"
+        session.initialize_wave_runtime((aircraft_id,), {aircraft_id: plan.roster[0]})
+        session.mark_aircraft_destroyed(aircraft_id)
+        session.transition(
+            SessionEvent.DROP_STARTED,
+            aircraft_id=aircraft_id,
+            encounter_id="encounter:wave-1",
+        )
+        self.assertEqual(
+            session.transition(
+                SessionEvent.CREW_CLEARED,
+                encounter_id="encounter:wave-1",
+            ),
+            GamePhase.GROUND_COMBAT,
+        )
+
+    def test_fixed_campaign_roster_and_special_rotation_are_exact(self) -> None:
+        director = WaveDirector()
+        expected = (
+            (AircraftType.NORMAL, AircraftType.NORMAL),
+            (AircraftType.NORMAL, AircraftType.MANPOWER_SUPPORT),
+            (AircraftType.FAST, AircraftType.MANPOWER_SUPPORT),
+            (AircraftType.ARMORED_BOSS, AircraftType.FAST),
+            (AircraftType.NORMAL, AircraftType.NORMAL, AircraftType.NORMAL),
+            (AircraftType.NORMAL, AircraftType.NORMAL, AircraftType.MANPOWER_SUPPORT),
+            (AircraftType.NORMAL, AircraftType.FAST, AircraftType.MANPOWER_SUPPORT),
+            (AircraftType.FAST, AircraftType.MANPOWER_SUPPORT, AircraftType.FAST),
+            (AircraftType.ARMORED_BOSS, AircraftType.MANPOWER_SUPPORT, AircraftType.FAST),
+            (AircraftType.NORMAL, AircraftType.NORMAL, AircraftType.NORMAL, AircraftType.NORMAL),
+            (AircraftType.NORMAL, AircraftType.NORMAL, AircraftType.NORMAL, AircraftType.MANPOWER_SUPPORT),
+            (AircraftType.NORMAL, AircraftType.NORMAL, AircraftType.FAST, AircraftType.MANPOWER_SUPPORT),
+            (AircraftType.NORMAL, AircraftType.FAST, AircraftType.MANPOWER_SUPPORT, AircraftType.FAST),
+            (AircraftType.MANPOWER_SUPPORT, AircraftType.FAST, AircraftType.MANPOWER_SUPPORT, AircraftType.FAST),
+            (AircraftType.ARMORED_BOSS, AircraftType.MANPOWER_SUPPORT, AircraftType.FAST, AircraftType.MANPOWER_SUPPORT),
+            (AircraftType.ARMORED_BOSS, AircraftType.ARMORED_BOSS, AircraftType.FAST, AircraftType.MANPOWER_SUPPORT),
+            (AircraftType.ARMORED_BOSS, AircraftType.ARMORED_BOSS, AircraftType.ARMORED_BOSS, AircraftType.FAST),
+            (AircraftType.ARMORED_BOSS, AircraftType.ARMORED_BOSS, AircraftType.ARMORED_BOSS, AircraftType.ARMORED_BOSS),
+        )
+
+        self.assertEqual(tuple(director.plan_wave(number).roster for number in range(1, 19)), expected)
+        self.assertEqual(normalize_aircraft_token("摩"), "魔")
+        self.assertEqual(normalize_aircraft_token("魔"), "魔")
+        with self.assertRaises(ValueError):
+            director.plan_wave(19)
+
+    def test_wave_plan_cap_is_structurally_validated_and_synthetic_override_is_explicit(self) -> None:
+        with self.assertRaises(ValueError):
+            WavePlan(1, 2, 1, False, (AircraftType.NORMAL, AircraftType.NORMAL))
+
+        fixture = WaveDirector().plan_wave(6, aircraft_count=6, cap=6)
+        self.assertEqual((fixture.aircraft_count, fixture.aircraft_cap), (6, 6))
+        self.assertEqual(len(fixture.roster), fixture.aircraft_count)
+
+    def test_crew_descent_interpolates_clamps_and_lands_once(self) -> None:
+        member = CrewMember(
+            id="drop-crew-1",
+            encounter_id="encounter:wave-1",
+            source_aircraft_id="aircraft-drop",
+            cover_node=config.COVER_NODES[0],
+            squad_role=SquadRole.COVER_SHOOTER,
+        )
+        start = (20.0, 30.0, -4.0)
+        landing = (21.0, config.GROUND_LEVEL_Y, -3.0)
+
+        self.assertTrue(member.begin_descent(start, landing, config.CREW_DESCENT_DURATION_SECONDS, (1.0, 1.0)))
+        self.assertEqual(member.behavior_state, CrewBehaviorState.DESCENDING)
+        self.assertEqual(member.position, start)
+        self.assertFalse(member.advance_descent(-3.0))
+        self.assertFalse(member.advance_descent(config.CREW_DESCENT_DURATION_SECONDS / 2.0))
+        self.assertEqual(member.position, (20.5, 15.0, -3.5))
+        self.assertTrue(member.advance_descent(config.CREW_DESCENT_DURATION_SECONDS))
+        self.assertEqual(member.position, landing)
+        self.assertEqual(member.behavior_state, CrewBehaviorState.IN_COVER)
+        self.assertFalse(member.advance_descent(1.0))
+
+    def test_drop_batch_preserves_source_composition_and_deterministic_spread(self) -> None:
+        factory = EncounterFactory()
+        batch = factory.create_drop_batch(
+            "aircraft-support",
+            AircraftType.MANPOWER_SUPPORT,
+            "encounter:wave-1",
+            (10.0, 25.0, 40.0),
+        )
+
+        self.assertEqual(len(batch), config.MANPOWER_SUPPORT_CREW)
+        self.assertTrue(all(member.source_aircraft_id == "aircraft-support" for member in batch))
+        self.assertTrue(all(member.behavior_state == CrewBehaviorState.DESCENDING for member in batch))
+        self.assertTrue(all(member.descent_start_position[1] == 25.0 for member in batch))
+        self.assertTrue(all(member.landing_position[1] == config.GROUND_LEVEL_Y for member in batch))
+        self.assertLessEqual(
+            max((member.descent_offset[0] ** 2 + member.descent_offset[1] ** 2) ** 0.5 for member in batch),
+            config.CREW_DESCENT_MAX_SPREAD_RADIUS,
+        )
+
+    def test_aggregate_batches_keep_independent_progress_and_count_death_once(self) -> None:
+        factory = EncounterFactory()
+        encounter = GroundEncounter(
+            aircraft_id="wave-1",
+            group_id="wave-1",
+            crew=[],
+        )
+        first = factory.create_drop_batch(
+            "aircraft-a",
+            AircraftType.MANPOWER_SUPPORT,
+            encounter.id,
+            (0.0, 20.0, 30.0),
+        )
+        second = factory.create_drop_batch(
+            "aircraft-b",
+            AircraftType.ARMORED_BOSS,
+            encounter.id,
+            (4.0, 22.0, 34.0),
+        )
+        self.assertTrue(encounter.add_reinforcement(first, "aircraft-a"))
+        self.assertTrue(encounter.add_reinforcement(second, "aircraft-b"))
+        self.assertFalse(encounter.add_reinforcement(second, "aircraft-b"))
+        self.assertEqual(encounter.batch_progress("aircraft-a"), BatchProgress("aircraft-a", 6, 6, 0))
+
+        defeated = first[0]
+        self.assertTrue(defeated.take_damage())
+        self.assertTrue(encounter.record_crew_cleared(defeated.id))
+        self.assertFalse(encounter.record_crew_cleared(defeated.id))
+        self.assertEqual(encounter.batch_progress("aircraft-a").cleared_count, 1)
+        self.assertEqual(encounter.batch_progress("aircraft-a").alive_count, 5)
+        self.assertEqual(encounter.batch_progress("aircraft-b").alive_count, 1)
+
+    def test_aggregate_constructor_does_not_double_count_supplied_progress(self) -> None:
+        factory = EncounterFactory()
+        members = list(
+            factory.create_drop_batch(
+                "aircraft-a",
+                AircraftType.MANPOWER_SUPPORT,
+                "encounter:wave-1",
+                (0.0, 20.0, 30.0),
+            )
+        )
+        self.assertTrue(members[0].take_damage())
+
+        encounter = GroundEncounter(
+            aircraft_id="wave-1",
+            group_id="wave-1",
+            crew=members,
+            source_aircraft_ids=("aircraft-a",),
+            batch_progress={
+                "aircraft-a": BatchProgress("aircraft-a", 6, 5, 1),
+            },
+        )
+
+        progress = encounter.batch_progress("aircraft-a")
+        self.assertIsNotNone(progress)
+        assert progress is not None
+        self.assertEqual(
+            (progress.spawned_count, progress.alive_count, progress.cleared_count),
+            (6, 5, 1),
+        )
+
+    def test_descending_members_are_targetable_but_not_ground_ai_or_city_damage(self) -> None:
+        factory = EncounterFactory()
+        encounter = GroundEncounter(aircraft_id="wave-1", group_id="wave-1", crew=[])
+        batch = factory.create_drop_batch(
+            "aircraft-support",
+            AircraftType.MANPOWER_SUPPORT,
+            encounter.id,
+            (0.0, 25.0, 30.0),
+        )
+        encounter.add_reinforcement(batch, "aircraft-support")
+        member = batch[0]
+        before_position = member.position
+        member.attack_cooldown = 0.0
+        building = TargetBuilding()
+        advance_crew_behavior(encounter, 1.0)
+        self.assertEqual(member.position, before_position)
+        self.assertFalse(member.ready_to_attack())
+        self.assertFalse(apply_city_damage(encounter, building, 1.0))
+        self.assertEqual(building.health, config.CITY_MAX_HEALTH)
+
+        session = GameSession()
+        session.start_new_game(WaveDirector().plan_wave(1, aircraft_count=1, cap=2))
+        session.phase = GamePhase.HYBRID_COMBAT
+        session.active_encounter_id = encounter.id
+        self.assertTrue(damage_crew_member(encounter, member.id, 1, session))
+        self.assertEqual(session.stats.enemies_defeated, 1)
+        self.assertFalse(encounter.record_crew_cleared(member.id))
+
+    def test_hybrid_allows_all_three_weapon_slots(self) -> None:
+        for weapon in WeaponKind:
+            self.assertTrue(inventory_selection_allowed(GamePhase.HYBRID_COMBAT, weapon))
+
+    def test_hybrid_city_damage_compatibility_api_remains_active(self) -> None:
+        session = GameSession()
+        session.start_new_game(WaveDirector().plan_wave(1, aircraft_count=1, cap=1))
+        session.phase = GamePhase.HYBRID_COMBAT
+
+        self.assertTrue(session.take_city_damage(session.city_health))
+        self.assertEqual(session.phase, GamePhase.GAME_OVER)
 
 
 class ExpandedGroundRuleTests(unittest.TestCase):

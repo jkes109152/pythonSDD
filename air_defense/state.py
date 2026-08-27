@@ -6,14 +6,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from .config import CITY_MAX_HEALTH, PLAYER_MAX_HEALTH
+from .config import CAMPAIGN_WAVE_COUNT, CITY_MAX_HEALTH, PLAYER_MAX_HEALTH
 
 
 class GamePhase(str, Enum):
     MAIN_MENU = "MAIN_MENU"
     AIRSTRIKE = "AIRSTRIKE"
+    HYBRID_COMBAT = "HYBRID_COMBAT"
     GROUND_COMBAT = "GROUND_COMBAT"
     GAME_OVER = "GAME_OVER"
+    VICTORY = "VICTORY"
 
 
 class LockState(str, Enum):
@@ -57,13 +59,17 @@ class CrewBehaviorState(str, Enum):
     IN_COVER = "IN_COVER"
     ADVANCING = "ADVANCING"
     RELOCATING = "RELOCATING"
+    DESCENDING = "DESCENDING"
 
 
 class SessionEvent(str, Enum):
     START_GAME = "START_GAME"
     AIRCRAFT_DESTROYED = "AIRCRAFT_DESTROYED"
+    DROP_STARTED = "DROP_STARTED"
     BUILDING_IMPACT = "BUILDING_IMPACT"
     CREW_CLEARED = "CREW_CLEARED"
+    WAVE_CLEARED = "WAVE_CLEARED"
+    VICTORY = "VICTORY"
     PLAYER_DIED = "PLAYER_DIED"
     CITY_DESTROYED = "CITY_DESTROYED"
     RETURN_TO_MENU = "RETURN_TO_MENU"
@@ -119,12 +125,25 @@ class WavePlan:
     roster: tuple[AircraftType, ...]
 
     def __post_init__(self) -> None:
-        if self.wave_number < 1:
-            raise ValueError("wave_number must be positive")
-        if self.aircraft_count < 1:
+        wave_number = int(self.wave_number)
+        aircraft_count = int(self.aircraft_count)
+        aircraft_cap = int(self.aircraft_cap)
+        if not 1 <= wave_number <= CAMPAIGN_WAVE_COUNT:
+            raise ValueError(
+                f"wave_number must be between 1 and {CAMPAIGN_WAVE_COUNT}"
+            )
+        if aircraft_count < 1:
             raise ValueError("aircraft_count must be positive")
-        if len(self.roster) != self.aircraft_count:
+        if aircraft_cap < aircraft_count:
+            raise ValueError("aircraft_cap must be at least aircraft_count")
+        roster = tuple(AircraftType(item) for item in self.roster)
+        if len(roster) != aircraft_count:
             raise ValueError("roster length must match aircraft_count")
+        object.__setattr__(self, "wave_number", wave_number)
+        object.__setattr__(self, "aircraft_count", aircraft_count)
+        object.__setattr__(self, "aircraft_cap", aircraft_cap)
+        object.__setattr__(self, "is_boss_wave", bool(self.is_boss_wave))
+        object.__setattr__(self, "roster", roster)
 
     def to_progress(self) -> WaveProgress:
         return WaveProgress(
@@ -153,6 +172,8 @@ class WaveRuntime:
     aircraft_types: dict[str, AircraftType] = field(default_factory=dict)
     active_target_id: Optional[str] = None
     ground_encounter_id: Optional[str] = None
+    drop_spawned_aircraft_ids: set[str] = field(default_factory=set)
+    hybrid_started: bool = False
 
     def __post_init__(self) -> None:
         self.aircraft_ids = tuple(str(aircraft_id) for aircraft_id in self.aircraft_ids)
@@ -162,6 +183,10 @@ class WaveRuntime:
             raise ValueError("aircraft_ids must be unique")
         if len(self.aircraft_ids) != self.wave.aircraft_count:
             raise ValueError("aircraft_ids length must match wave aircraft_count")
+        if self.active_target_id is not None:
+            self.active_target_id = str(self.active_target_id)
+        if self.ground_encounter_id is not None:
+            self.ground_encounter_id = str(self.ground_encounter_id)
 
         default_types = dict(zip(self.aircraft_ids, self.wave.roster))
         if not self.aircraft_types:
@@ -188,6 +213,12 @@ class WaveRuntime:
             raise ValueError("aircraft_statuses keys must match aircraft_ids")
         if self.active_target_id is not None and self.active_target_id not in self.aircraft_ids:
             raise ValueError("active_target_id must belong to aircraft_ids")
+        self.drop_spawned_aircraft_ids = {
+            str(aircraft_id) for aircraft_id in self.drop_spawned_aircraft_ids
+        }
+        if not self.drop_spawned_aircraft_ids.issubset(set(self.aircraft_ids)):
+            raise ValueError("drop source IDs must belong to aircraft_ids")
+        self.hybrid_started = bool(self.hybrid_started)
 
     @property
     def alive_aircraft_ids(self) -> tuple[str, ...]:
@@ -211,6 +242,44 @@ class WaveRuntime:
         return bool(self.aircraft_ids) and all(
             self.aircraft_statuses[aircraft_id] == AircraftPhase.DESTROYED
             for aircraft_id in self.aircraft_ids
+        )
+
+    @property
+    def has_active_drop(self) -> bool:
+        return self.hybrid_started or self.ground_encounter_id is not None
+
+    @property
+    def all_drop_decisions_processed(self) -> bool:
+        """Return whether every destroyed source has had its drop resolved."""
+
+        return self.drop_spawned_aircraft_ids == set(self.aircraft_ids)
+
+    def mark_drop_spawned(self, aircraft_id: str) -> bool:
+        """Record one source decision, including an intentionally empty batch."""
+
+        aircraft_id = str(aircraft_id)
+        if (
+            aircraft_id not in self.aircraft_ids
+            or self.aircraft_statuses[aircraft_id] != AircraftPhase.DESTROYED
+            or aircraft_id in self.drop_spawned_aircraft_ids
+        ):
+            return False
+        self.drop_spawned_aircraft_ids.add(aircraft_id)
+        return True
+
+    def start_hybrid_drop(self) -> bool:
+        """Mark the first non-empty drop without resetting later source batches."""
+
+        if self.hybrid_started:
+            return False
+        self.hybrid_started = True
+        return True
+
+    def can_complete_wave(self, ground_cleared: bool) -> bool:
+        return (
+            self.all_aircraft_destroyed
+            and self.all_drop_decisions_processed
+            and bool(ground_cleared)
         )
 
     def sync_aircraft_phase(
@@ -305,7 +374,7 @@ class SessionStats:
 
 @dataclass
 class GameSession:
-    """Small explicit state machine for one endless game session."""
+    """Small explicit state machine for one finite campaign session."""
 
     phase: GamePhase = GamePhase.MAIN_MENU
     health: int = PLAYER_MAX_HEALTH
@@ -356,15 +425,20 @@ class GameSession:
         after it has generated deterministic IDs for the roster.
         """
 
+        ids = tuple(str(aircraft_id) for aircraft_id in aircraft_ids)
+        types = (
+            {str(aircraft_id): AircraftType(aircraft_type)
+             for aircraft_id, aircraft_type in aircraft_types.items()}
+            if aircraft_types
+            else dict(zip(ids, self.wave.roster))
+        )
         self.wave_runtime = WaveRuntime(
             wave=self.wave,
-            aircraft_ids=aircraft_ids,
-            aircraft_types=aircraft_types or dict(
-                zip(aircraft_ids, self.wave.roster)
-            ),
+            aircraft_ids=ids,
+            aircraft_types=types,
         )
-        self.active_aircraft_id = aircraft_ids[0]
-        self.active_aircraft_type = self.wave_runtime.aircraft_types[aircraft_ids[0]]
+        self.active_aircraft_id = ids[0]
+        self.active_aircraft_type = self.wave_runtime.aircraft_types[ids[0]]
         return self.wave_runtime
 
     def sync_aircraft_phase(self, aircraft_id: str, phase: AircraftPhase) -> bool:
@@ -386,6 +460,7 @@ class GameSession:
         changed = self.wave_runtime.mark_destroyed(aircraft_id)
         if changed:
             key = f"aircraft-destroyed:{aircraft_id}"
+            self._processed_events.add(key)
             self.stats.record_once(key, "aircraft_destroyed")
             self.active_aircraft_id = (
                 self.wave_runtime.alive_aircraft_ids[0]
@@ -426,6 +501,7 @@ class GameSession:
         aircraft_id: Optional[str] = None,
         encounter_id: Optional[str] = None,
         wave_plan: Optional["WavePlan"] = None,
+        ground_cleared: Optional[bool] = None,
     ) -> GamePhase:
         event = SessionEvent(event)
         if event == SessionEvent.START_GAME:
@@ -434,15 +510,15 @@ class GameSession:
             return self.phase
 
         if event == SessionEvent.RETURN_TO_MENU:
-            if self.phase == GamePhase.GAME_OVER:
+            if self.phase in (GamePhase.GAME_OVER, GamePhase.VICTORY):
                 self._reset_to_menu()
             return self.phase
 
-        if self.phase == GamePhase.GAME_OVER:
+        if self.phase in (GamePhase.GAME_OVER, GamePhase.VICTORY):
             return self.phase
 
         if event == SessionEvent.AIRCRAFT_DESTROYED:
-            if self.phase != GamePhase.AIRSTRIKE:
+            if self.phase not in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT):
                 return self.phase
             if self.wave_runtime is not None:
                 target_id = aircraft_id or self.wave_runtime.active_target_id or self.active_aircraft_id
@@ -457,20 +533,26 @@ class GameSession:
                 self.stats.record_once(key, "aircraft_destroyed")
                 self.wave_runtime.set_active_target(None)
                 if self.wave_runtime.all_aircraft_destroyed:
-                    self.active_encounter_id = (
-                        self.wave_runtime.ground_encounter_id
-                        or f"encounter:wave-{self.wave.wave_number}"
-                    )
-                    self.wave_runtime.ground_encounter_id = self.active_encounter_id
+                    self.active_encounter_id = self.wave_runtime.ground_encounter_id
                     self.active_aircraft_id = None
                     self.active_aircraft_type = None
                     self.reset_airstrike_guidance()
+                    # The controller performs the aggregate clear predicate.
+                    # Keep the old keyed transition useful for callers that do
+                    # not create a drop manager by entering ground combat.
                     self.phase = GamePhase.GROUND_COMBAT
+                elif self.wave_runtime.hybrid_started:
+                    self.active_aircraft_id = self.wave_runtime.alive_aircraft_ids[0]
+                    self.active_aircraft_type = self.wave_runtime.aircraft_types[
+                        self.active_aircraft_id
+                    ]
+                    self.phase = GamePhase.HYBRID_COMBAT
                 else:
                     self.active_aircraft_id = self.wave_runtime.alive_aircraft_ids[0]
                     self.active_aircraft_type = self.wave_runtime.aircraft_types[
                         self.active_aircraft_id
                     ]
+                    self.phase = GamePhase.AIRSTRIKE
                 return self.phase
             if aircraft_id is not None and aircraft_id != self.active_aircraft_id:
                 return self.phase
@@ -485,8 +567,42 @@ class GameSession:
             self.phase = GamePhase.GROUND_COMBAT
             return self.phase
 
+        if event == SessionEvent.DROP_STARTED:
+            if self.phase not in (
+                GamePhase.AIRSTRIKE,
+                GamePhase.HYBRID_COMBAT,
+                GamePhase.GROUND_COMBAT,
+            ):
+                return self.phase
+            runtime = self.wave_runtime
+            source_id = aircraft_id
+            if runtime is None or source_id is None or source_id not in runtime.aircraft_ids:
+                return self.phase
+            if runtime.aircraft_statuses[source_id] != AircraftPhase.DESTROYED:
+                return self.phase
+            if (
+                encounter_id is not None
+                and runtime.ground_encounter_id not in (None, encounter_id)
+            ):
+                return self.phase
+            key = event_id or f"drop-started:{runtime.wave.wave_number}:{source_id}"
+            if key in self._processed_events:
+                return self.phase
+            if not runtime.mark_drop_spawned(source_id):
+                return self.phase
+            self._processed_events.add(key)
+            runtime.start_hybrid_drop()
+            if encounter_id is not None:
+                runtime.ground_encounter_id = encounter_id
+                self.active_encounter_id = encounter_id
+            if runtime.all_aircraft_destroyed:
+                self.phase = GamePhase.GROUND_COMBAT
+            else:
+                self.phase = GamePhase.HYBRID_COMBAT
+            return self.phase
+
         if event == SessionEvent.BUILDING_IMPACT:
-            if self.phase != GamePhase.AIRSTRIKE:
+            if self.phase not in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT):
                 return self.phase
             if self.wave_runtime is not None:
                 target_id = aircraft_id or self.active_aircraft_id
@@ -513,36 +629,47 @@ class GameSession:
             self.phase = GamePhase.GAME_OVER
             return self.phase
 
-        if event == SessionEvent.CREW_CLEARED:
-            if self.phase != GamePhase.GROUND_COMBAT:
+        if event == SessionEvent.WAVE_CLEARED:
+            if self.phase not in (
+                GamePhase.AIRSTRIKE,
+                GamePhase.HYBRID_COMBAT,
+                GamePhase.GROUND_COMBAT,
+            ):
                 return self.phase
-            if self.wave_runtime is not None:
-                current_id = encounter_id or self.active_encounter_id
-                if (
-                    current_id is None
-                    or self.wave_runtime.ground_encounter_id not in (None, current_id)
-                ):
+            runtime = self.wave_runtime
+            if runtime is not None:
+                current_id = encounter_id or self.active_encounter_id or runtime.ground_encounter_id
+                if not runtime.all_aircraft_destroyed:
                     return self.phase
-                key = event_id or f"crew-cleared:{current_id}"
-                if key in self._processed_events:
+                if not runtime.all_drop_decisions_processed:
                     return self.phase
-                self._processed_events.add(key)
+                if runtime.has_active_drop and ground_cleared is not True:
+                    return self.phase
+                if current_id is not None and runtime.ground_encounter_id != current_id:
+                    return self.phase
+            elif self.phase != GamePhase.GROUND_COMBAT:
+                return self.phase
+            key = event_id or f"wave-cleared:{self.wave.wave_number}"
+            if key in self._processed_events:
+                return self.phase
+            self._processed_events.add(key)
+            if self.wave.wave_number >= CAMPAIGN_WAVE_COUNT:
+                self.phase = GamePhase.VICTORY
+                self.active_aircraft_id = None
+                self.active_aircraft_type = None
+                self.reset_airstrike_guidance()
+                return self.phase
+
+            if runtime is not None:
                 next_wave = (
                     wave_plan.to_progress()
                     if wave_plan is not None
                     else WaveProgress(
                         wave_number=self.wave.wave_number + 1,
-                        aircraft_count=self.wave.aircraft_count + 1,
-                        aircraft_cap=(
-                            self.wave.aircraft_cap + 2
-                            if self.wave.aircraft_count >= self.wave.aircraft_cap
-                            else self.wave.aircraft_cap
-                        ),
-                        is_boss_wave=(self.wave.wave_number + 1) % 10 == 0,
-                        roster=tuple(
-                            AircraftType.NORMAL
-                            for _ in range(self.wave.aircraft_count + 1)
-                        ),
+                        aircraft_count=self.wave.aircraft_count,
+                        aircraft_cap=self.wave.aircraft_cap,
+                        is_boss_wave=False,
+                        roster=self.wave.roster,
                     )
                 )
                 self.wave = next_wave
@@ -557,6 +684,70 @@ class GameSession:
                 self.initialize_wave_runtime(ids, dict(zip(ids, next_wave.roster)))
                 self.reset_airstrike_guidance()
                 self.phase = GamePhase.AIRSTRIKE
+                return self.phase
+
+            if encounter_id is not None and encounter_id != self.active_encounter_id:
+                return self.phase
+            current_id = encounter_id or self.active_encounter_id or "unknown-encounter"
+            self.active_encounter_id = None
+            if self.wave.advance_aircraft():
+                pass
+            elif wave_plan is not None:
+                self.wave = wave_plan.to_progress()
+            else:
+                next_count = self.wave.aircraft_count + 1
+                next_cap = self.wave.aircraft_cap + 2 if self.wave.aircraft_count >= self.wave.aircraft_cap else self.wave.aircraft_cap
+                self.wave = WaveProgress(
+                    wave_number=self.wave.wave_number + 1,
+                    aircraft_count=next_count,
+                    aircraft_cap=next_cap,
+                    is_boss_wave=False,
+                    roster=tuple(AircraftType.NORMAL for _ in range(next_count)),
+                )
+            self.aircraft_sequence += 1
+            self.active_aircraft_id = self._aircraft_id(self.aircraft_sequence)
+            self.active_aircraft_type = self.wave.active_aircraft_type
+            self.reset_airstrike_guidance()
+            self.phase = GamePhase.AIRSTRIKE
+            return self.phase
+
+        if event == SessionEvent.VICTORY:
+            if self.phase not in (
+                GamePhase.AIRSTRIKE,
+                GamePhase.HYBRID_COMBAT,
+                GamePhase.GROUND_COMBAT,
+            ):
+                return self.phase
+            runtime = self.wave_runtime
+            if self.wave.wave_number != CAMPAIGN_WAVE_COUNT:
+                return self.phase
+            if runtime is not None and not runtime.all_aircraft_destroyed:
+                return self.phase
+            if runtime is not None and not runtime.all_drop_decisions_processed:
+                return self.phase
+            if runtime is not None and runtime.has_active_drop and ground_cleared is not True:
+                return self.phase
+            if runtime is None and (
+                self.phase != GamePhase.GROUND_COMBAT
+                or ground_cleared is not True
+            ):
+                return self.phase
+            key = event_id or f"victory:{self.wave.wave_number}"
+            if key in self._processed_events:
+                return self.phase
+            self._processed_events.add(key)
+            self.phase = GamePhase.VICTORY
+            self.active_aircraft_id = None
+            self.active_aircraft_type = None
+            self.reset_airstrike_guidance()
+            return self.phase
+
+        if event == SessionEvent.CREW_CLEARED:
+            if self.phase != GamePhase.GROUND_COMBAT:
+                return self.phase
+            # Keyed runtimes use WAVE_CLEARED after the aggregate predicate;
+            # this compatibility event must never bypass that condition.
+            if self.wave_runtime is not None:
                 return self.phase
             if encounter_id is not None and encounter_id != self.active_encounter_id:
                 return self.phase
@@ -577,7 +768,7 @@ class GameSession:
                     wave_number=self.wave.wave_number + 1,
                     aircraft_count=next_count,
                     aircraft_cap=next_cap,
-                    is_boss_wave=(self.wave.wave_number + 1) % 10 == 0,
+                    is_boss_wave=False,
                     roster=tuple(AircraftType.NORMAL for _ in range(next_count)),
                 )
             self.aircraft_sequence += 1
@@ -588,7 +779,11 @@ class GameSession:
             return self.phase
 
         if event == SessionEvent.PLAYER_DIED:
-            if self.phase not in (GamePhase.AIRSTRIKE, GamePhase.GROUND_COMBAT):
+            if self.phase not in (
+                GamePhase.AIRSTRIKE,
+                GamePhase.HYBRID_COMBAT,
+                GamePhase.GROUND_COMBAT,
+            ):
                 return self.phase
             key = event_id or "player-died"
             if key in self._processed_events:
@@ -601,7 +796,7 @@ class GameSession:
             return self.phase
 
         if event == SessionEvent.CITY_DESTROYED:
-            if self.phase != GamePhase.GROUND_COMBAT:
+            if self.phase not in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT):
                 return self.phase
             key = event_id or "city-destroyed"
             if key in self._processed_events:
@@ -616,7 +811,11 @@ class GameSession:
         return self.phase
 
     def take_damage(self, amount: int) -> bool:
-        if self.phase not in (GamePhase.AIRSTRIKE, GamePhase.GROUND_COMBAT):
+        if self.phase not in (
+            GamePhase.AIRSTRIKE,
+            GamePhase.HYBRID_COMBAT,
+            GamePhase.GROUND_COMBAT,
+        ):
             return False
         self.health = max(0, self.health - max(0, amount))
         if self.health == 0:
@@ -627,7 +826,7 @@ class GameSession:
     def take_city_damage(self, amount: float) -> bool:
         """Apply city damage and transition once when its health reaches zero."""
 
-        if self.phase != GamePhase.GROUND_COMBAT or amount <= 0:
+        if self.phase not in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT) or amount <= 0:
             return False
         self.city_health = max(0.0, self.city_health - amount)
         if self.city_health <= 0.0:
@@ -636,11 +835,15 @@ class GameSession:
         return False
 
     def tick(self, delta_seconds: float) -> None:
-        if self.phase in (GamePhase.AIRSTRIKE, GamePhase.GROUND_COMBAT):
+        if self.phase in (
+            GamePhase.AIRSTRIKE,
+            GamePhase.HYBRID_COMBAT,
+            GamePhase.GROUND_COMBAT,
+        ):
             self.stats.tick(delta_seconds)
 
     def can_use_anti_air(self) -> bool:
-        return self.phase == GamePhase.AIRSTRIKE and self.held_weapon == WeaponKind.ANTI_AIRCRAFT
+        return self.phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT) and self.held_weapon == WeaponKind.ANTI_AIRCRAFT
 
     def set_anti_air_scope(self, enabled: bool) -> None:
         """Set the anti-air scope state; closing it clears lock progress immediately."""

@@ -86,6 +86,7 @@ class AirDefenseGame:
         self._aircraft_screen_targets: dict[str, object] = {}
         self._tracer_event_ids: set[str] = set()
         self._game_over_snapshot: Optional[dict[str, object]] = None
+        self._victory_presented = False
 
         self.hud.bind_menu_actions(self.start_game, self.quit_game)
         self.hud.bind_return_action(self.return_to_menu)
@@ -112,8 +113,9 @@ class AirDefenseGame:
         self.encounter = None
         self.aircrafts.clear()
         self._aircraft_screen_target = None
-        self._aircraft_screen_targets.clear()
+        getattr(self, "_aircraft_screen_targets", {}).clear()
         self._game_over_snapshot = None
+        self._victory_presented = False
         self._tracer_event_ids.clear()
         self._game_over_presented = False
         self._hit_feedback_seconds = 0.0
@@ -132,7 +134,7 @@ class AirDefenseGame:
         application.quit()
 
     def return_to_menu(self) -> None:
-        if self.session.phase == GamePhase.GAME_OVER:
+        if self.session.phase in (GamePhase.GAME_OVER, GamePhase.VICTORY):
             self.session.transition(SessionEvent.RETURN_TO_MENU)
         self.reset_weapon_cooldowns()
         self.scene.clear_world()
@@ -147,6 +149,7 @@ class AirDefenseGame:
         self._aircraft_screen_target = None
         self._aircraft_screen_targets.clear()
         self._game_over_snapshot = None
+        self._victory_presented = False
         self._tracer_event_ids.clear()
         self.scene.set_scope_enabled(False)
         self._game_over_presented = False
@@ -171,10 +174,14 @@ class AirDefenseGame:
                     self.quit_game()
             return
 
-        if self.session.phase == GamePhase.GAME_OVER:
+        if self.session.phase in (GamePhase.GAME_OVER, GamePhase.VICTORY):
             if key in ("enter", "escape"):
                 self.return_to_menu()
-            elif key == "left mouse down" and self.hud.return_button.hovered:
+            elif key == "left mouse down" and (
+                self.hud.return_button.hovered
+                or getattr(self.hud, "victory_return_button", None) is not None
+                and self.hud.victory_return_button.hovered
+            ):
                 self.return_to_menu()
             return
 
@@ -208,17 +215,23 @@ class AirDefenseGame:
         self.scene.tick_effects(delta_seconds)
         position = self.scene.player_position()
         self.player.position = (float(position.x), float(position.y), float(position.z))
-        self._tick_weapon_cooldowns(delta_seconds)
-
-        if self.session.phase in (GamePhase.AIRSTRIKE, GamePhase.GROUND_COMBAT):
+        gameplay_phase = self.session.phase in (
+            GamePhase.AIRSTRIKE,
+            GamePhase.HYBRID_COMBAT,
+            GamePhase.GROUND_COMBAT,
+        )
+        if gameplay_phase:
+            self._tick_weapon_cooldowns(delta_seconds)
             self.session.tick(delta_seconds)
 
-        if self.session.phase == GamePhase.AIRSTRIKE:
+        if self.session.phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT):
             self._update_airstrike(delta_seconds)
-        elif self.session.phase == GamePhase.GROUND_COMBAT:
+        if self.session.phase in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT):
             self._update_ground_combat(delta_seconds)
         elif self.session.phase == GamePhase.GAME_OVER:
             self._present_game_over()
+        elif self.session.phase == GamePhase.VICTORY:
+            self._present_victory()
 
         self.player.health = self.session.health
         if self._hit_feedback_seconds > 0:
@@ -323,7 +336,7 @@ class AirDefenseGame:
         return destroyed_any
 
     def _on_aircraft_destroyed(self, aircraft_id: Optional[str] = None) -> None:
-        """Resolve one collision and enter ground combat only after the wave."""
+        """Resolve one collision and immediately attach its source drop batch."""
 
         aircrafts = getattr(self, "aircrafts", {})
         aircraft = aircrafts.get(aircraft_id) if aircraft_id is not None else None
@@ -363,12 +376,14 @@ class AirDefenseGame:
                 self._complete_encounter()
             return
 
-        if self.session.phase != GamePhase.AIRSTRIKE or not runtime.mark_destroyed(aircraft_id):
+        if self.session.phase not in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT):
             return
-        self.session.stats.record_once(
-            f"aircraft-destroyed:{aircraft_id}",
-            "aircraft_destroyed",
-        )
+        aircraft_type = runtime.aircraft_types.get(aircraft_id, aircraft.aircraft_type)
+        if aircraft_id in runtime.drop_spawned_aircraft_ids:
+            return
+        hit_position = tuple(aircraft.position)
+        if not self.session.mark_aircraft_destroyed(aircraft_id):
+            return
         self.scene.remove_aircraft(aircraft_id, crash=False)
         aircrafts.pop(aircraft_id, None)
         for missile_id, missile in tuple(self.active_missiles.items()):
@@ -380,37 +395,59 @@ class AirDefenseGame:
             self._reset_airstrike_guidance(clear_missiles=False)
         runtime.set_active_target(None)
         self._aircraft_screen_target = None
-        self._aircraft_screen_targets.pop(aircraft_id, None)
+        getattr(self, "_aircraft_screen_targets", {}).pop(aircraft_id, None)
 
-        if not runtime.all_aircraft_destroyed:
+        # Source completion is recorded even when FAST (or a zero-roll NORMAL)
+        # intentionally produces no crew, so duplicate callbacks can never
+        # create the same batch twice.
+        encounter_id = runtime.ground_encounter_id or (
+            f"encounter:wave-{runtime.wave.wave_number}"
+        )
+        batch = self.encounter_factory.create_drop_batch(
+            aircraft_id,
+            aircraft_type,
+            encounter_id,
+            hit_position,
+        )
+        if not batch:
+            runtime.mark_drop_spawned(aircraft_id)
+        else:
+            if self.encounter is None:
+                self.encounter = GroundEncounter(
+                    aircraft_id=f"wave-{runtime.wave.wave_number}",
+                    crew=[],
+                    group_id=f"wave-{runtime.wave.wave_number}",
+                )
+            encounter = self.encounter
+            if encounter.id != encounter_id or not encounter.add_reinforcement(batch, aircraft_id):
+                return
+            self.session.transition(
+                SessionEvent.DROP_STARTED,
+                event_id=f"drop-started:{runtime.wave.wave_number}:{aircraft_id}",
+                aircraft_id=aircraft_id,
+                encounter_id=encounter.id,
+            )
+            self.session.active_encounter_id = encounter.id
+            self.scene.create_crew_members(batch)
+            if self.scene.world is not None:
+                self.scene.world.sniper_pickup.enabled = True
+
+        if runtime.all_aircraft_destroyed:
+            self.aircraft = None
+            self.session.active_aircraft_id = None
+            self.session.active_aircraft_type = None
+            self._reset_airstrike_guidance(clear_missiles=False)
+            self.scene.set_scope_enabled(False)
+        else:
             alive_id = runtime.alive_aircraft_ids[0] if runtime.alive_aircraft_ids else None
             self.session.active_aircraft_id = alive_id
             self.session.active_aircraft_type = (
                 runtime.aircraft_types[alive_id] if alive_id is not None else None
             )
             self.aircraft = aircrafts.get(alive_id)
-            return
 
-        self.aircraft = None
-        self._reset_airstrike_guidance(clear_missiles=False)
-        self.scene.set_scope_enabled(False)
-        encounter = self.encounter_factory.create_for_wave(
-            runtime.wave.wave_number,
-            runtime.aircraft_ids,
-            runtime.aircraft_types,
-        )
-        self.encounter = encounter
-        runtime.ground_encounter_id = encounter.id
-        self.session.active_encounter_id = encounter.id
-        self.session.active_aircraft_id = None
-        self.session.active_aircraft_type = None
-        self.session.phase = GamePhase.GROUND_COMBAT
-        if self.scene.world is not None:
-            self.scene.world.sniper_pickup.enabled = True
-        if encounter.cleared:
+        if self._wave_clear_ready():
             self._complete_encounter()
-        else:
-            self.scene.create_crew(encounter)
 
     def _on_aircraft_impacted(self, aircraft_id: str) -> None:
         """Make one impact a global terminal event and stop every dynamic path."""
@@ -442,7 +479,7 @@ class AirDefenseGame:
         self.aircrafts.clear()
         self.aircraft = None
         self._aircraft_screen_target = None
-        self._aircraft_screen_targets.clear()
+        getattr(self, "_aircraft_screen_targets", {}).clear()
         self.encounter = None
         self.scene.set_scope_enabled(False)
         self.reset_weapon_cooldowns()
@@ -473,7 +510,7 @@ class AirDefenseGame:
 
         # Process target-bound missiles before calculating the next lock view.
         self._update_active_missiles(delta_seconds)
-        if self.session.phase != GamePhase.AIRSTRIKE:
+        if self.session.phase not in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT):
             return
         aircrafts = getattr(self, "aircrafts", {}) or (
             {self.aircraft.id: self.aircraft} if self.aircraft is not None else {}
@@ -550,7 +587,15 @@ class AirDefenseGame:
 
     def _update_ground_combat(self, delta_seconds: float) -> None:
         if self.encounter is None:
+            if self._wave_clear_ready():
+                self._complete_encounter()
             return
+        # Descent belongs to each CrewMember.  Updating it before the existing
+        # ground pass keeps a newly landed member eligible for ground rules in
+        # the same frame while airborne members remain fully targetable.
+        for member in self.encounter.crew:
+            member.advance_descent(delta_seconds)
+        self.scene.update_crew(self.encounter)
         advance_crew_behavior(self.encounter, delta_seconds)
         self.scene.update_crew(self.encounter)
         city_destroyed = apply_city_damage(self.encounter, self.city, delta_seconds)
@@ -594,18 +639,22 @@ class AirDefenseGame:
                 self._present_game_over()
                 return
         self.scene.update_crew(self.encounter)
+        if self._wave_clear_ready():
+            self._complete_encounter()
 
     def _interact(self) -> None:
         preferred_kind = (
             "anti_aircraft"
             if self.session.phase == GamePhase.AIRSTRIKE
+            else None
+            if self.session.phase == GamePhase.HYBRID_COMBAT
             else "sniper"
         )
         entity = self.scene.interactable_under_center(preferred_kind=preferred_kind)
         if entity is None or self.scene.world is None:
             return
         if entity is self.scene.world.anti_aircraft_pickup:
-            if self.session.phase != GamePhase.AIRSTRIKE or self.anti_aircraft is None:
+            if self.session.phase not in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT) or self.anti_aircraft is None:
                 return
             if not self.scene.is_near(entity.world_position, 3.5):
                 return
@@ -615,7 +664,7 @@ class AirDefenseGame:
             return
 
         if entity is self.scene.world.sniper_pickup or entity is self.scene.world.weapon_rack:
-            if self.session.phase != GamePhase.GROUND_COMBAT or self.sniper is None:
+            if self.session.phase not in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT) or self.sniper is None:
                 return
             if not self.scene.is_near(self.scene.world.weapon_rack.world_position, 3.5):
                 return
@@ -727,17 +776,17 @@ class AirDefenseGame:
 
     def _fire_current_weapon(self) -> None:
         if (
-            self.session.phase == GamePhase.AIRSTRIKE
+            self.session.phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
             and self.session.held_weapon == WeaponKind.ANTI_AIRCRAFT
         ):
             self._fire_anti_aircraft()
         elif (
-            self.session.phase == GamePhase.GROUND_COMBAT
+            self.session.phase in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
             and self.session.held_weapon == WeaponKind.SNIPER
         ):
             self._fire_sniper()
         elif (
-            self.session.phase == GamePhase.GROUND_COMBAT
+            self.session.phase in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
             and self.session.held_weapon == WeaponKind.PISTOL
         ):
             self._fire_pistol()
@@ -753,7 +802,7 @@ class AirDefenseGame:
         )
         target_aircraft = aircrafts.get(target_id) if target_id is not None else None
         if (
-            self.session.phase != GamePhase.AIRSTRIKE
+            self.session.phase not in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
             or self.anti_aircraft is None
             or not self.session.anti_air_scope_enabled
             or target_aircraft is None
@@ -788,7 +837,7 @@ class AirDefenseGame:
 
     def _fire_sniper(self) -> None:
         if (
-            self.session.phase != GamePhase.GROUND_COMBAT
+            self.session.phase not in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
             or self.encounter is None
             or self.sniper is None
         ):
@@ -796,11 +845,14 @@ class AirDefenseGame:
         if not can_fire_sniper(self.sniper.fire_cooldown, self.session.held_weapon):
             return
         target_id = self.scene.crew_under_center(config.SNIPER_MAX_RANGE)
+        if target_id is None:
+            return
         target_entity = self.scene.crew_entities.get(target_id)
-        target_distance = (
-            distance_xz(self.scene.player_position(), target_entity.world_position)
-            if target_entity is not None
-            else None
+        if target_entity is None:
+            return
+        target_distance = distance_xz(
+            self.scene.player_position(),
+            target_entity.world_position,
         )
         if not can_fire_sniper(
             self.sniper.fire_cooldown,
@@ -819,7 +871,7 @@ class AirDefenseGame:
 
     def _fire_pistol(self) -> None:
         if (
-            self.session.phase != GamePhase.GROUND_COMBAT
+            self.session.phase not in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
             or self.encounter is None
             or self.pistol is None
         ):
@@ -847,50 +899,69 @@ class AirDefenseGame:
         if self.encounter.cleared:
             self._complete_encounter()
 
+    def _wave_clear_ready(self) -> bool:
+        """Return the single named predicate used by every clear boundary."""
+
+        runtime = self.session.wave_runtime
+        if runtime is None:
+            return False
+        ground_cleared = self.encounter is None or self.encounter.cleared
+        return runtime.can_complete_wave(ground_cleared)
+
+    def _clear_current_wave_visuals(self) -> None:
+        """Remove current-wave combat entities while preserving short effects."""
+
+        self._clear_active_missiles()
+        self.scene.clear_dynamic(clear_effects=False)
+        self.encounter = None
+        self.aircraft = None
+        self.aircrafts.clear()
+        self._aircraft_screen_target = None
+        getattr(self, "_aircraft_screen_targets", {}).clear()
+        getattr(self, "_tracer_event_ids", set()).clear()
+        self.lock_tracker.set_scope_enabled(False)
+        if self.sniper is not None:
+            self.sniper.scope_enabled = False
+        self.scene.set_scope_enabled(False)
+        self.reset_weapon_cooldowns()
+        if self.scene.world is not None:
+            self.scene.world.sniper_pickup.enabled = False
+
     def _complete_encounter(self) -> None:
-        if self.encounter is None:
-            return
         runtime = self.session.wave_runtime
         if runtime is not None:
-            encounter_id = self.encounter.id
-            if runtime.ground_encounter_id not in (None, encounter_id):
+            if not self._wave_clear_ready():
                 return
-            self.scene.clear_dynamic(clear_effects=False)
-            self.encounter = None
-            self.aircraft = None
-            self.aircrafts.clear()
-            self._aircraft_screen_target = None
-            self._aircraft_screen_targets.clear()
-            self._tracer_event_ids.clear()
-            self.lock_tracker.set_scope_enabled(False)
-            if self.sniper is not None:
-                self.sniper.scope_enabled = False
-            self.scene.set_scope_enabled(False)
-            self.reset_weapon_cooldowns()
-            next_plan = self.wave_director.plan_wave(runtime.wave.wave_number + 1)
-            self.session.wave = next_plan.to_progress()
-            self.session.wave_runtime = None
-            next_ids = tuple(
-                f"aircraft-{next_plan.wave_number:03d}"
-                if index == 0
-                else f"aircraft-{next_plan.wave_number:03d}-{index + 1:02d}"
-                for index in range(next_plan.aircraft_count)
+            encounter_id = (
+                self.encounter.id
+                if self.encounter is not None
+                else runtime.ground_encounter_id
             )
-            self.session.initialize_wave_runtime(
-                next_ids,
-                dict(zip(next_ids, next_plan.roster)),
+            event_id = f"wave-cleared:{runtime.wave.wave_number}"
+            final_wave = self.wave_director.is_final_wave(runtime.wave.wave_number)
+            next_plan = None if final_wave else self.wave_director.plan_wave(runtime.wave.wave_number + 1)
+            self._clear_current_wave_visuals()
+            self.session.transition(
+                SessionEvent.WAVE_CLEARED,
+                event_id=event_id,
+                encounter_id=encounter_id,
+                wave_plan=next_plan,
+                ground_cleared=True,
             )
-            self.session.active_encounter_id = None
-            self.session.phase = GamePhase.AIRSTRIKE
-            if self.scene.world is not None:
-                self.scene.world.sniper_pickup.enabled = False
-            if self.session.held_weapon != WeaponKind.ANTI_AIRCRAFT:
-                self.scene.move_weapon_pickup(
-                    "anti_aircraft",
-                    config.DEFENSE_POINT_POSITION,
-                    enabled=True,
-                )
-            self._spawn_current_aircraft()
+            if self.session.phase == GamePhase.VICTORY:
+                self._present_victory()
+                return
+            if self.session.phase == GamePhase.AIRSTRIKE:
+                if self.session.held_weapon != WeaponKind.ANTI_AIRCRAFT:
+                    self.scene.move_weapon_pickup(
+                        "anti_aircraft",
+                        config.DEFENSE_POINT_POSITION,
+                        enabled=True,
+                    )
+                self._spawn_current_aircraft()
+            return
+
+        if self.encounter is None:
             return
 
         # Legacy single-aircraft transition retained for callers that do not
@@ -938,11 +1009,35 @@ class AirDefenseGame:
         getattr(self, "_tracer_event_ids", set()).clear()
         if hasattr(self.scene, "clear_ground_tracers"):
             self.scene.clear_ground_tracers()
+        if hasattr(self.scene, "clear_dynamic"):
+            self.scene.clear_dynamic(clear_effects=False)
         getattr(self, "aircrafts", {}).clear()
         self.aircraft = None
+        self.encounter = None
         self.scene.set_gameplay_enabled(False)
         self.scene.set_scope_enabled(False)
         self.hud.show_game_over(self.session.stats)
+
+    def _present_victory(self) -> None:
+        if self.session.phase != GamePhase.VICTORY or self._victory_presented:
+            return
+        self._victory_presented = True
+        self._game_over_snapshot = self.session.stats.snapshot()
+        self._reset_airstrike_guidance(clear_missiles=True)
+        self.reset_weapon_cooldowns()
+        self._aircraft_screen_target = None
+        getattr(self, "_aircraft_screen_targets", {}).clear()
+        getattr(self, "_tracer_event_ids", set()).clear()
+        if hasattr(self.scene, "clear_ground_tracers"):
+            self.scene.clear_ground_tracers()
+        if hasattr(self.scene, "clear_dynamic"):
+            self.scene.clear_dynamic(clear_effects=False)
+        getattr(self, "aircrafts", {}).clear()
+        self.aircraft = None
+        self.encounter = None
+        self.scene.set_gameplay_enabled(False)
+        self.scene.set_scope_enabled(False)
+        self.hud.show_victory(self.session.stats)
 
     def _refresh_hud(self) -> None:
         active_projection = self._aircraft_screen_target
@@ -965,6 +1060,19 @@ class AirDefenseGame:
                 prompt = "綠框已鎖定，按左鍵發射"
             else:
                 prompt = "將白框對準戰鬥機完成鎖定"
+        elif self.session.phase == GamePhase.HYBRID_COMBAT:
+            if self.session.held_weapon == WeaponKind.ANTI_AIRCRAFT:
+                prompt = (
+                    "綠框已鎖定，按左鍵發射；按 2／3 攻擊降落敵人"
+                    if self.session.lock_state == LockState.GREEN_READY
+                    else "防空砲可繼續鎖定；按 2／3 攻擊降落敵人"
+                )
+            elif self.session.held_weapon == WeaponKind.PISTOL:
+                prompt = "手槍近距離射擊；按 1／2 切換武器"
+            elif self.session.held_weapon == WeaponKind.SNIPER:
+                prompt = "右鍵瞄準，左鍵射擊；按 1／3 切換武器"
+            else:
+                prompt = "物品欄按 1／2／3 選擇武器"
         elif self.session.phase == GamePhase.GROUND_COMBAT:
             if self.session.held_weapon is None:
                 prompt = "物品欄按 2 裝備狙擊槍，或按 3 裝備手槍"
@@ -984,7 +1092,7 @@ class AirDefenseGame:
             if aircraft.phase not in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED)
         ]
         warning = bool(
-            self.session.phase == GamePhase.AIRSTRIKE
+            self.session.phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
             and impact_times
             and warning_active(min(impact_times))
         )
@@ -995,7 +1103,7 @@ class AirDefenseGame:
         boss_label = None
         if self.session.wave.is_boss_wave:
             if (
-                self.session.phase == GamePhase.AIRSTRIKE
+                self.session.phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
                 and aircrafts
             ):
                 boss_aircraft = next(
@@ -1008,8 +1116,9 @@ class AirDefenseGame:
                     boss_health = boss_aircraft.health
                     boss_max_health = boss_aircraft.max_health
                     boss_label = "裝甲飛機 HP"
-            elif (
-                self.session.phase == GamePhase.GROUND_COMBAT
+            if (
+                boss_health is None
+                and self.session.phase in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
                 and self.encounter is not None
                 and self.encounter.boss_id is not None
             ):
@@ -1032,7 +1141,7 @@ class AirDefenseGame:
                 and self.sniper.scope_enabled
             ),
             anti_air_scope_enabled=(
-                self.session.phase == GamePhase.AIRSTRIKE
+                self.session.phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
                 and self.session.held_weapon == WeaponKind.ANTI_AIRCRAFT
                 and self.session.anti_air_scope_enabled
             ),
@@ -1070,7 +1179,11 @@ class AirDefenseGame:
                     WeaponKind.SNIPER: self.sniper,
                     WeaponKind.PISTOL: self.pistol,
                 },
-                gameplay=self.session.phase in (GamePhase.AIRSTRIKE, GamePhase.GROUND_COMBAT),
+                gameplay=self.session.phase in (
+                    GamePhase.AIRSTRIKE,
+                    GamePhase.HYBRID_COMBAT,
+                    GamePhase.GROUND_COMBAT,
+                ),
             ),
         )
 
