@@ -922,10 +922,10 @@ def inventory_selection_allowed(
     """Return whether an inventory slot is usable in the current phase."""
 
     return (
-        phase == GamePhase.AIRSTRIKE
+        phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
         and requested_weapon == WeaponKind.ANTI_AIRCRAFT
     ) or (
-        phase == GamePhase.GROUND_COMBAT
+        phase in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
         and requested_weapon in (WeaponKind.SNIPER, WeaponKind.PISTOL)
     )
 
@@ -1058,12 +1058,16 @@ def resolve_session_event(
     event_id: Optional[str] = None,
     aircraft_id: Optional[str] = None,
     encounter_id: Optional[str] = None,
+    wave_plan: Optional[WavePlan] = None,
+    ground_cleared: Optional[bool] = None,
 ) -> GamePhase:
     return session.transition(
         event,
         event_id=event_id,
         aircraft_id=aircraft_id,
         encounter_id=encounter_id,
+        wave_plan=wave_plan,
+        ground_cleared=ground_cleared,
     )
 
 
@@ -1123,13 +1127,44 @@ def aircraft_profile(aircraft_type: AircraftType) -> AircraftProfile:
     return profiles[aircraft_type]
 
 
+def normalize_aircraft_token(token: str) -> str:
+    """Normalize the user-facing special-aircraft alias to the canonical token."""
+
+    normalized = str(token).strip()
+    if normalized == "摩":
+        normalized = "魔"
+    if normalized not in {"普", "特", "魔"}:
+        raise ValueError(f"Unknown aircraft token: {token}")
+    return normalized
+
+
 class WaveDirector:
-    """Build deterministic rosters and preserve the increasing-count rule."""
+    """Build the finite, deterministic campaign roster."""
 
     _REGULAR_TYPES = (
         AircraftType.NORMAL,
         AircraftType.MANPOWER_SUPPORT,
         AircraftType.FAST,
+    )
+    _CAMPAIGN_TOKENS = (
+        ("普", "普"),
+        ("普", "特"),
+        ("特", "特"),
+        ("魔", "特"),
+        ("普", "普", "普"),
+        ("普", "普", "特"),
+        ("普", "特", "特"),
+        ("特", "特", "特"),
+        ("魔", "特", "特"),
+        ("普", "普", "普", "普"),
+        ("普", "普", "普", "特"),
+        ("普", "普", "特", "特"),
+        ("普", "特", "特", "特"),
+        ("特", "特", "特", "特"),
+        ("魔", "特", "特", "特"),
+        ("魔", "魔", "特", "特"),
+        ("魔", "魔", "魔", "特"),
+        ("魔", "魔", "魔", "魔"),
     )
 
     def __init__(
@@ -1143,7 +1178,10 @@ class WaveDirector:
         self.cap_increment = max(1, cap_increment)
 
     def aircraft_count_for_wave(self, wave_number: int) -> int:
-        return self.initial_aircraft_count + max(0, wave_number - 1)
+        wave_number = int(wave_number)
+        if not 1 <= wave_number <= len(self._CAMPAIGN_TOKENS):
+            raise ValueError("wave_number must be between 1 and 18")
+        return len(self._CAMPAIGN_TOKENS[wave_number - 1])
 
     def cap_for_count(self, aircraft_count: int) -> int:
         aircraft_count = max(1, aircraft_count)
@@ -1158,17 +1196,30 @@ class WaveDirector:
         aircraft_count: Optional[int] = None,
         cap: Optional[int] = None,
     ) -> WavePlan:
-        wave_number = max(1, int(wave_number))
-        count = aircraft_count or self.aircraft_count_for_wave(wave_number)
-        count = max(1, int(count))
-        aircraft_cap = max(1, int(cap)) if cap is not None else self.cap_for_count(count)
-        is_boss_wave = wave_number % 10 == 0
-        roster = tuple(
-            AircraftType.ARMORED_BOSS
-            if is_boss_wave and index == 0
-            else self._REGULAR_TYPES[(wave_number + index - 1) % len(self._REGULAR_TYPES)]
-            for index in range(count)
-        )
+        wave_number = int(wave_number)
+        if not 1 <= wave_number <= len(self._CAMPAIGN_TOKENS):
+            raise ValueError("wave_number must be between 1 and 18")
+        has_synthetic_override = aircraft_count is not None or cap is not None
+        if has_synthetic_override:
+            count = (
+                self.aircraft_count_for_wave(wave_number)
+                if aircraft_count is None
+                else int(aircraft_count)
+            )
+            if count < 1:
+                raise ValueError("aircraft_count must be positive")
+            if cap is not None and int(cap) < count:
+                raise ValueError("cap must be at least aircraft_count")
+            aircraft_cap = self.cap_for_count(count) if cap is None else int(cap)
+            roster = tuple(
+                self._REGULAR_TYPES[index % len(self._REGULAR_TYPES)]
+                for index in range(count)
+            )
+        else:
+            roster = self._campaign_roster(wave_number)
+            count = len(roster)
+            aircraft_cap = self.cap_for_count(count)
+        is_boss_wave = AircraftType.ARMORED_BOSS in roster
         return WavePlan(
             wave_number=wave_number,
             aircraft_count=count,
@@ -1187,7 +1238,36 @@ class WaveDirector:
                 is_boss_wave=progress.is_boss_wave,
                 roster=progress.roster,
             )
+        if progress.wave_number >= len(self._CAMPAIGN_TOKENS):
+            raise ValueError("wave 18 has no successor")
         return self.plan_wave(progress.wave_number + 1).to_progress()
+
+    def is_final_wave(self, wave_number: int) -> bool:
+        return int(wave_number) == len(self._CAMPAIGN_TOKENS)
+
+    @classmethod
+    def _campaign_roster(cls, wave_number: int) -> tuple[AircraftType, ...]:
+        special_ordinal = 0
+        for index, raw_roster in enumerate(cls._CAMPAIGN_TOKENS, start=1):
+            resolved: list[AircraftType] = []
+            for raw_token in raw_roster:
+                token = normalize_aircraft_token(raw_token)
+                if token == "普":
+                    resolved.append(AircraftType.NORMAL)
+                elif token == "魔":
+                    resolved.append(AircraftType.ARMORED_BOSS)
+                elif token == "特":
+                    special_ordinal += 1
+                    resolved.append(
+                        AircraftType.MANPOWER_SUPPORT
+                        if special_ordinal % 2 == 1
+                        else AircraftType.FAST
+                    )
+                else:  # pragma: no cover - normalize guards the table itself
+                    raise ValueError(f"Unknown campaign token: {raw_token}")
+            if index == wave_number:
+                return tuple(resolved)
+        raise ValueError("wave_number must be between 1 and 18")
 
 
 class EncounterFactory:
@@ -1214,7 +1294,9 @@ class EncounterFactory:
         if not isinstance(aircraft_type, AircraftType):
             if random_source is None and hasattr(aircraft_type, "randint"):
                 random_source = aircraft_type  # type: ignore[assignment]
-            aircraft_type = AircraftType.NORMAL
+                aircraft_type = AircraftType.NORMAL
+            else:
+                aircraft_type = AircraftType(aircraft_type)
         source = random_source if random_source is not None else random
         encounter_id = f"encounter:{aircraft_id}"
         count = self._crew_count(aircraft_type, source)
@@ -1232,6 +1314,42 @@ class EncounterFactory:
             boss_id=members[0].id if aircraft_type == AircraftType.ARMORED_BOSS and members else None,
             source_aircraft_ids=(aircraft_id,),
         )
+
+    def create_drop_batch(
+        self,
+        aircraft_id: str,
+        aircraft_type: AircraftType,
+        encounter_id: str,
+        hit_position: tuple[float, float, float],
+        random_source: Optional[RandomSource] = None,
+    ) -> tuple[object, ...]:
+        """Create one immediately visible source batch in descent state."""
+
+        aircraft_id = str(aircraft_id)
+        encounter_id = str(encounter_id)
+        aircraft_type = AircraftType(aircraft_type)
+        source = random_source if random_source is not None else random
+        count = self._crew_count(aircraft_type, source)
+        members = self._create_source_crew(
+            aircraft_id,
+            aircraft_type,
+            count,
+            encounter_id,
+        )
+        hit = tuple(float(value) for value in hit_position)
+        for index, member in enumerate(members):
+            offset = config.CREW_DESCENT_SPREAD_OFFSETS[
+                index % len(config.CREW_DESCENT_SPREAD_OFFSETS)
+            ]
+            start = (hit[0] + offset[0], hit[1], hit[2] + offset[1])
+            landing = (start[0], config.GROUND_LEVEL_Y, start[2])
+            member.begin_descent(
+                start,
+                landing,
+                config.CREW_DESCENT_DURATION_SECONDS,
+                offset,
+            )
+        return tuple(members)
 
     def create_for_wave(
         self,
@@ -1325,6 +1443,7 @@ class EncounterFactory:
                     encounter_id=encounter_id,
                     cover_node=current_node,
                     squad_role=role,
+                    source_aircraft_id=aircraft_id,
                     behavior_state=CrewBehaviorState.IN_COVER,
                     position=config.CRASH_SITE_POSITION,
                     target_cover_node=target_node,
@@ -1360,7 +1479,7 @@ def advance_crew_behavior(
     interval_seconds = max(0.0, interval_seconds)
 
     for member in encounter.crew:
-        if not member.alive:
+        if not member.alive or member.behavior_state == CrewBehaviorState.DESCENDING:
             continue
 
         # Keep the explicit state sequence used by the old encounter tests.
@@ -1446,7 +1565,7 @@ def damage_crew_member(
     """Apply guarded firearm damage and return true only when the target dies."""
 
     if session is not None and (
-        session.phase != GamePhase.GROUND_COMBAT
+        session.phase not in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
         or session.active_encounter_id != encounter.id
     ):
         return False
@@ -1456,6 +1575,8 @@ def damage_crew_member(
     defeated = member.take_damage(damage)
     if defeated and session is not None:
         session.stats.record_once(f"enemy-defeated:{crew_id}", "enemy_defeated")
+    if defeated:
+        encounter.record_crew_cleared(crew_id)
     encounter.refresh_cleared()
     return defeated
 
@@ -1473,7 +1594,7 @@ def apply_city_damage(
     radius = float(getattr(building, "attack_zone_radius", config.CITY_ATTACK_RADIUS))
     attackers = []
     for member in encounter.crew:
-        if not member.alive:
+        if not member.alive or member.behavior_state == CrewBehaviorState.DESCENDING:
             continue
         if (
             member.at_city
@@ -1535,10 +1656,16 @@ def _move_towards(
     )
 
 
-def add_reinforcement(encounter: GroundEncounter, *_: object) -> bool:
-    """The feature explicitly has no ground reinforcement path."""
+def add_reinforcement(
+    encounter: GroundEncounter,
+    members: Optional[Sequence[object]] = None,
+    source_aircraft_id: Optional[str] = None,
+) -> bool:
+    """Compatibility wrapper for the aggregate encounter operation."""
 
-    return False
+    if members is None or source_aircraft_id is None:
+        return False
+    return encounter.add_reinforcement(list(members), source_aircraft_id)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
@@ -1562,14 +1689,18 @@ def resolve_aircraft_outcome(
             aircraft_id=aircraft_id,
         )
         return AirstrikeOutcome(
-            session.phase == GamePhase.GROUND_COMBAT,
-            "aircraft_destroyed" if before == GamePhase.AIRSTRIKE else "ignored",
+            session.phase in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT),
+            "aircraft_destroyed"
+            if before in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
+            else "ignored",
         )
     if outcome == "building_impact":
         before = session.phase
         session.transition(SessionEvent.BUILDING_IMPACT, aircraft_id=aircraft_id)
         return AirstrikeOutcome(
             session.phase == GamePhase.GAME_OVER,
-            "building_impact" if before == GamePhase.AIRSTRIKE else "ignored",
+            "building_impact"
+            if before in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
+            else "ignored",
         )
     raise ValueError(f"Unknown aircraft outcome: {outcome}")

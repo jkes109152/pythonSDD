@@ -10,6 +10,7 @@ from air_defense.entities import Aircraft, AntiAircraftGun, Pistol, SniperRifle
 from air_defense.hud import GameHUD
 from air_defense.main import AirDefenseGame
 from air_defense.rules import LockOnTracker
+from air_defense.rules import EncounterFactory, WaveDirector
 from air_defense.scene import AirDefenseScene
 from air_defense.state import (
     AircraftPhase,
@@ -18,6 +19,7 @@ from air_defense.state import (
     GamePhase,
     GameSession,
     SessionEvent,
+    WeaponKind,
 )
 
 
@@ -191,7 +193,7 @@ class WholeWaveLifecycleTests(unittest.TestCase):
             GamePhase.GROUND_COMBAT,
         )
         self.assertEqual(session.wave_runtime.remaining_aircraft_count, 0)
-        self.assertEqual(session.active_encounter_id, "encounter:wave-1")
+        self.assertIsNone(session.active_encounter_id)
 
     def test_impact_marks_only_terminal_failure_and_freezes_progress(self) -> None:
         session, ids = self._runtime_session()
@@ -229,6 +231,175 @@ class WholeWaveLifecycleTests(unittest.TestCase):
             (game.anti_aircraft.fire_cooldown, game.sniper.fire_cooldown, game.pistol.fire_cooldown),
             (0.0, 0.0, 0.0),
         )
+
+
+class AircraftEnemyDescentLifecycleTests(unittest.TestCase):
+    def _drop_game(
+        self,
+        aircraft_types: tuple[AircraftType, ...],
+        *,
+        wave_number: int = 1,
+    ) -> AirDefenseGame:
+        game = AirDefenseGame.__new__(AirDefenseGame)
+        game.session = GameSession()
+        plan = WaveDirector().plan_wave(wave_number, aircraft_count=len(aircraft_types), cap=len(aircraft_types))
+        game.session.start_new_game(plan)
+        ids = tuple(f"drop-aircraft-{index + 1}" for index in range(len(aircraft_types)))
+        game.session.initialize_wave_runtime(ids, dict(zip(ids, aircraft_types)))
+        game.aircrafts = {
+            aircraft_id: Aircraft(
+                id=aircraft_id,
+                aircraft_type=aircraft_type,
+                position=(float(index * 8), 24.0 + index, 50.0 + index),
+            )
+            for index, (aircraft_id, aircraft_type) in enumerate(zip(ids, aircraft_types))
+        }
+        game.aircraft = game.aircrafts[ids[0]]
+        game.encounter = None
+        game.encounter_factory = EncounterFactory(minimum=2, maximum=2)
+        game.lock_tracker = LockOnTracker()
+        game.anti_aircraft = None
+        game.sniper = None
+        game.pistol = None
+        game.active_missiles = {}
+        game._missile_sequence = 0
+        game._aircraft_screen_target = None
+        game._aircraft_screen_targets = {}
+        game._tracer_event_ids = set()
+        game.scene = Mock(world=None)
+        game.scene.create_crew_members = Mock()
+        game.scene.remove_aircraft = Mock()
+        game.scene.set_scope_enabled = Mock()
+        game.scene.set_gameplay_enabled = Mock()
+        game.scene.clear_ground_tracers = Mock()
+        game.wave_director = WaveDirector()
+        game.hud = Mock()
+        game._game_over_presented = False
+        game._game_over_snapshot = None
+        game._victory_presented = False
+        return game
+
+    def test_destroyed_aircraft_immediately_creates_one_source_batch_at_saved_position(self) -> None:
+        game = self._drop_game((AircraftType.MANPOWER_SUPPORT, AircraftType.NORMAL))
+        aircraft = game.aircrafts["drop-aircraft-1"]
+        aircraft.take_damage()
+        hit_position = aircraft.position
+
+        game._on_aircraft_destroyed(aircraft.id)
+
+        self.assertEqual(game.session.phase, GamePhase.HYBRID_COMBAT)
+        self.assertIsNotNone(game.encounter)
+        assert game.encounter is not None
+        self.assertEqual(game.encounter.source_aircraft_ids, (aircraft.id,))
+        self.assertEqual(len(game.encounter.crew), 6)
+        self.assertEqual(game.encounter.crew[0].descent_start_position, hit_position)
+        self.assertTrue(any(member.descent_start_position != hit_position for member in game.encounter.crew[1:]))
+        self.assertEqual(game.scene.create_crew_members.call_count, 1)
+        self.assertEqual(len(game.aircrafts), 1)
+
+        game._on_aircraft_destroyed(aircraft.id)
+        self.assertEqual(len(game.encounter.crew), 6)
+        self.assertEqual(game.session.stats.aircraft_destroyed, 1)
+
+    def test_empty_fast_drop_does_not_create_an_encounter_or_hybrid_phase(self) -> None:
+        game = self._drop_game((AircraftType.FAST, AircraftType.NORMAL))
+        aircraft = game.aircrafts["drop-aircraft-1"]
+        aircraft.take_damage()
+
+        game._on_aircraft_destroyed(aircraft.id)
+
+        self.assertIsNone(game.encounter)
+        self.assertEqual(game.session.phase, GamePhase.AIRSTRIKE)
+        self.assertEqual(game.session.wave_runtime.drop_spawned_aircraft_ids, {aircraft.id})
+
+    def test_descending_kill_is_removed_and_counted_once(self) -> None:
+        game = self._drop_game((AircraftType.MANPOWER_SUPPORT,))
+        aircraft = game.aircrafts["drop-aircraft-1"]
+        aircraft.take_damage()
+        game._on_aircraft_destroyed(aircraft.id)
+        assert game.encounter is not None
+        member_id = game.encounter.crew[0].id
+
+        self.assertTrue(game.encounter.crew[0].take_damage())
+        self.assertTrue(game.encounter.record_crew_cleared(member_id))
+        self.assertFalse(game.encounter.record_crew_cleared(member_id))
+        self.assertEqual(game.encounter.batch_progress(aircraft.id).cleared_count, 1)
+
+    def test_multiple_source_batches_run_independently_until_both_aircraft_and_crew_clear(self) -> None:
+        game = self._drop_game((AircraftType.MANPOWER_SUPPORT, AircraftType.MANPOWER_SUPPORT))
+        first, second = tuple(game.aircrafts.values())
+        first.take_damage()
+        game._on_aircraft_destroyed(first.id)
+        self.assertEqual(game.session.phase, GamePhase.HYBRID_COMBAT)
+        second.take_damage()
+        game._on_aircraft_destroyed(second.id)
+        self.assertEqual(game.session.phase, GamePhase.GROUND_COMBAT)
+        assert game.encounter is not None
+        self.assertEqual(set(game.encounter.source_aircraft_ids), {first.id, second.id})
+        self.assertEqual(game.encounter.batch_progress(first.id).alive_count, 6)
+        self.assertEqual(game.encounter.batch_progress(second.id).alive_count, 6)
+
+        for member in game.encounter.crew[:6]:
+            member.take_damage()
+            game.encounter.record_crew_cleared(member.id)
+        game._complete_encounter()
+        self.assertEqual(game.session.wave.wave_number, 1)
+        self.assertEqual(game.session.phase, GamePhase.GROUND_COMBAT)
+
+        for member in game.encounter.crew[6:]:
+            member.take_damage()
+            game.encounter.record_crew_cleared(member.id)
+        game._complete_encounter()
+        self.assertEqual(game.session.wave.wave_number, 2)
+        self.assertEqual(game.session.phase, GamePhase.AIRSTRIKE)
+
+    def test_wave_18_empty_drop_enters_victory_without_spawning_wave_19(self) -> None:
+        game = self._drop_game((AircraftType.FAST,), wave_number=18)
+        aircraft = game.aircrafts["drop-aircraft-1"]
+        aircraft.take_damage()
+
+        game._on_aircraft_destroyed(aircraft.id)
+
+        self.assertEqual(game.session.phase, GamePhase.VICTORY)
+        self.assertEqual(game.session.wave.wave_number, 18)
+        game._on_aircraft_destroyed(aircraft.id)
+        self.assertEqual(game.session.wave.wave_number, 18)
+        game.input("enter")
+        self.assertEqual(game.session.phase, GamePhase.MAIN_MENU)
+
+    def test_hybrid_aircraft_impact_precedes_ground_updates_and_freezes_run(self) -> None:
+        game = self._drop_game((AircraftType.MANPOWER_SUPPORT, AircraftType.MANPOWER_SUPPORT))
+        first, second = tuple(game.aircrafts.values())
+        first.take_damage()
+        game._on_aircraft_destroyed(first.id)
+        self.assertEqual(game.session.phase, GamePhase.HYBRID_COMBAT)
+
+        game._on_aircraft_impacted(second.id)
+
+        self.assertEqual(game.session.phase, GamePhase.GAME_OVER)
+        self.assertIsNone(game.encounter)
+        self.assertEqual(game.aircrafts, {})
+        game._on_aircraft_impacted(second.id)
+        self.assertEqual(game.session.stats.failure_reason, FailureReason.BUILDING_IMPACT)
+
+
+class WeaponFireGuardTests(unittest.TestCase):
+    def test_sniper_does_not_consume_cooldown_without_a_target(self) -> None:
+        game = AirDefenseGame.__new__(AirDefenseGame)
+        game.session = GameSession()
+        game.session.start_new_game()
+        game.session.phase = GamePhase.HYBRID_COMBAT
+        game.session.held_weapon = WeaponKind.SNIPER
+        game.session.active_encounter_id = "encounter:wave-1"
+        game.encounter = SimpleNamespace(id="encounter:wave-1")
+        game.sniper = SniperRifle(world_position=(0.0, 0.0, 0.0))
+        game.scene = Mock()
+        game.scene.crew_under_center.return_value = None
+        game.scene.crew_entities = {}
+
+        game._fire_sniper()
+
+        self.assertEqual(game.sniper.fire_cooldown, 0.0)
 
 
 if __name__ == "__main__":

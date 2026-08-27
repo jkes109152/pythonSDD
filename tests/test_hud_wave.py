@@ -10,6 +10,7 @@ import unittest
 from types import SimpleNamespace
 
 from air_defense import config
+from air_defense.hud import GameHUD
 from air_defense.entities import (
     AntiAircraftGun,
     GroundTracerEffect,
@@ -25,6 +26,7 @@ from air_defense.rules import (
     build_wave_status_view,
     is_inside_expanded_lock_frame,
     is_inside_lock_frame,
+    inventory_selection_allowed,
     lock_frame_bounds,
     reset_weapon_cooldowns,
     reticle_position_for_progress,
@@ -34,7 +36,9 @@ from air_defense.rules import (
 from air_defense.state import (
     AircraftPhase,
     AircraftType,
+    GamePhase,
     LockState,
+    WeaponKind,
     WavePlan,
     WaveRuntime,
 )
@@ -238,6 +242,55 @@ class AggregateWaveFixtureTests(unittest.TestCase):
         self.assertEqual(len(encounter.crew), 2 + config.MANPOWER_SUPPORT_CREW + 0 + 1)
         self.assertEqual(len(random_source.calls), 1)
         self.assertTrue(all(member.id.startswith(tuple(f"{source}-" for source in ids)) for member in encounter.crew))
+
+
+class VictoryHudFixtureTests(unittest.TestCase):
+    def test_victory_presentation_is_frozen_and_has_return_action(self) -> None:
+        hud = GameHUD.__new__(GameHUD)
+        hud.menu_root = SimpleNamespace(enabled=True)
+        hud.gameplay_root = SimpleNamespace(enabled=False)
+        hud.game_over_root = SimpleNamespace(enabled=False)
+        hud.victory_root = SimpleNamespace(enabled=False)
+        hud.victory_text = SimpleNamespace(text="")
+        hud.victory_stats_text = SimpleNamespace(text="")
+        stats = SimpleNamespace(
+            survival_seconds=18.0,
+            aircraft_destroyed=12,
+            enemies_defeated=24,
+        )
+
+        hud.show_victory(stats)
+
+        self.assertFalse(hud.menu_root.enabled)
+        self.assertTrue(hud.gameplay_root.enabled)
+        self.assertTrue(hud.victory_root.enabled)
+        self.assertIn("你贏了", hud.victory_text.text)
+        self.assertIn("擊落飛機 12", hud.victory_stats_text.text)
+
+    def test_hybrid_inventory_has_no_descent_progress_contract(self) -> None:
+        self.assertTrue(all(
+            inventory_selection_allowed(GamePhase.HYBRID_COMBAT, weapon)
+            for weapon in WeaponKind
+        ))
+
+    def test_hybrid_reticle_selects_the_requested_weapon_family(self) -> None:
+        hud = GameHUD.__new__(GameHUD)
+        hud.lock_frame = SimpleNamespace(enabled=False)
+        hud.lock_label = SimpleNamespace(enabled=False)
+        hud.lock_reticle = SimpleNamespace(enabled=False)
+        hud.sniper_crosshair = SimpleNamespace(enabled=False)
+        hud.pistol_reticle = SimpleNamespace(enabled=False)
+        hud.scope_overlay = SimpleNamespace(enabled=False)
+
+        hud.update_reticle(WeaponKind.SNIPER, GamePhase.HYBRID_COMBAT)
+        self.assertTrue(hud.sniper_crosshair.enabled)
+        self.assertFalse(hud.pistol_reticle.enabled)
+        self.assertFalse(hud.lock_frame.enabled)
+
+        hud.update_reticle(WeaponKind.ANTI_AIRCRAFT, GamePhase.HYBRID_COMBAT, anti_air_scope_enabled=True)
+        self.assertTrue(hud.lock_frame.enabled)
+        self.assertTrue(hud.lock_label.enabled)
+        self.assertFalse(hud.sniper_crosshair.enabled)
 
 
 if __name__ == "__main__":

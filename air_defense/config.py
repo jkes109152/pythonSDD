@@ -28,6 +28,29 @@ AIRSTRIKE_WARNING_LEAD_SECONDS = 8.0
 CREW_ADVANCE_INTERVAL_SECONDS = 2.0
 AIRCRAFT_FORMATION_HORIZONTAL_SPACING = 10.0
 
+# Fixed campaign and aircraft-drop tuning.  Keep these values in the shared
+# configuration so the domain, scene adapter and controller use one contract.
+CAMPAIGN_WAVE_COUNT = 18
+CREW_DESCENT_DURATION_SECONDS = 4.0
+CREW_DESCENT_TOLERANCE_SECONDS = 0.25
+GROUND_LEVEL_Y = 0.0
+CREW_DESCENT_MAX_SPREAD_RADIUS = 2.5
+CREW_DESCENT_SPREAD_OFFSETS = (
+    (0.0, 0.0),
+    (-1.4, 0.8),
+    (1.4, 0.8),
+    (-1.4, -0.8),
+    (1.4, -0.8),
+    (0.0, 1.6),
+    (0.0, -1.6),
+    (-2.0, 0.0),
+    (2.0, 0.0),
+    (-2.0, 1.0),
+    (2.0, 1.0),
+    (-2.0, -1.0),
+    (2.0, -1.0),
+)
+
 # The HUD is authored in camera.ui normalized coordinates. These values keep
 # the two status cards away from the central targeting stack and inventory.
 HUD_FONT = "NotoSansTC-VF.ttf"

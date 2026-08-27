@@ -47,6 +47,7 @@ class GameHUD:
         self.gameplay_root = Entity(parent=self.root, enabled=False)
         self.menu_root = Entity(parent=self.root, enabled=False)
         self.game_over_root = Entity(parent=self.root, enabled=False)
+        self.victory_root = Entity(parent=self.root, enabled=False)
 
         self.lock_frame = self._make_reticle(self.gameplay_root)
         self.lock_ring = self._make_tracking_ring(self.gameplay_root)
@@ -207,6 +208,7 @@ class GameHUD:
 
         self._build_menu()
         self._build_game_over()
+        self._build_victory()
 
     def _build_status_cards(self) -> None:
         """Build the two responsive status cards from procedural primitives."""
@@ -675,7 +677,7 @@ class GameHUD:
         self._text(parent=self.menu_root, text="3D 防空守衛", origin=(0, 0), y=0.22, scale=2.0)
         self._text(
             parent=self.menu_root,
-            text="守住大樓，撐過無限空襲循環",
+            text="守住大樓，完成固定 18 波戰役",
             origin=(0, 0),
             y=0.11,
             scale=0.85,
@@ -701,22 +703,56 @@ class GameHUD:
             y=-0.18,
         )
 
+    def _build_victory(self) -> None:
+        Entity(
+            parent=self.victory_root,
+            model="quad",
+            scale=(0.78, 0.78),
+            color=color.rgba32(14, 38, 35, 240),
+        )
+        self.victory_text = self._text(
+            parent=self.victory_root,
+            text="你贏了",
+            origin=(0, 0),
+            y=0.25,
+            scale=1.8,
+            color=_rgb(config.GREEN_RGB),
+        )
+        self.victory_stats_text = self._text(
+            parent=self.victory_root,
+            text="",
+            origin=(0, 0),
+            y=0.0,
+            scale=0.9,
+        )
+        self.victory_return_button = Button(
+            parent=self.victory_root,
+            text="返回主選單",
+            scale=(0.3, 0.075),
+            y=-0.18,
+        )
+
     def bind_menu_actions(self, start: Callable[[], None], quit_game: Callable[[], None]) -> None:
         self.start_button.on_click = start
         self.quit_button.on_click = quit_game
 
     def bind_return_action(self, callback: Callable[[], None]) -> None:
         self.return_button.on_click = callback
+        self.victory_return_button.on_click = callback
 
     def show_main_menu(self) -> None:
         self.menu_root.enabled = True
         self.gameplay_root.enabled = False
         self.game_over_root.enabled = False
+        if hasattr(self, "victory_root"):
+            self.victory_root.enabled = False
 
     def show_gameplay(self) -> None:
         self.menu_root.enabled = False
         self.gameplay_root.enabled = True
         self.game_over_root.enabled = False
+        if hasattr(self, "victory_root"):
+            self.victory_root.enabled = False
 
     def show_game_over(self, stats: SessionStats) -> None:
         self.menu_root.enabled = False
@@ -725,6 +761,8 @@ class GameHUD:
         # GAME_OVER update path below.
         self.gameplay_root.enabled = True
         self.game_over_root.enabled = True
+        if hasattr(self, "victory_root"):
+            self.victory_root.enabled = False
         reason = {
             FailureReason.BUILDING_IMPACT: "飛機撞擊大樓",
             FailureReason.PLAYER_DEAD: "玩家生命值歸零",
@@ -732,6 +770,20 @@ class GameHUD:
         }.get(stats.failure_reason, "防守失敗")
         self.failure_text.text = reason
         self.final_stats_text.text = (
+            f"存活時間 {stats.survival_seconds:.1f} 秒\n"
+            f"擊落飛機 {stats.aircraft_destroyed}  架\n"
+            f"擊倒敵人 {stats.enemies_defeated}  名"
+        )
+
+    def show_victory(self, stats: SessionStats) -> None:
+        """Show a frozen final result without adding descent-specific HUD."""
+
+        self.menu_root.enabled = False
+        self.gameplay_root.enabled = True
+        self.game_over_root.enabled = False
+        self.victory_root.enabled = True
+        self.victory_text.text = "你贏了"
+        self.victory_stats_text.text = (
             f"存活時間 {stats.survival_seconds:.1f} 秒\n"
             f"擊落飛機 {stats.aircraft_destroyed}  架\n"
             f"擊倒敵人 {stats.enemies_defeated}  名"
@@ -795,12 +847,12 @@ class GameHUD:
         """Show exactly one weapon reticle family for the active phase/slot."""
 
         anti_air_equipped = (
-            phase == GamePhase.AIRSTRIKE
+            phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
             and weapon == WeaponKind.ANTI_AIRCRAFT
         )
         anti_air_scope_active = anti_air_equipped and anti_air_scope_enabled
-        sniper_active = phase == GamePhase.GROUND_COMBAT and weapon == WeaponKind.SNIPER
-        pistol_active = phase == GamePhase.GROUND_COMBAT and weapon == WeaponKind.PISTOL
+        sniper_active = phase in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT) and weapon == WeaponKind.SNIPER
+        pistol_active = phase in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT) and weapon == WeaponKind.PISTOL
         # The enlarged fixed frame remains visible while the anti-air weapon
         # is equipped; dynamic lock feedback is scope-only.
         self.lock_frame.enabled = anti_air_equipped
@@ -918,18 +970,20 @@ class GameHUD:
             wave_view,
             visible=phase in (
                 GamePhase.AIRSTRIKE,
+                GamePhase.HYBRID_COMBAT,
                 GamePhase.GROUND_COMBAT,
                 GamePhase.GAME_OVER,
+                GamePhase.VICTORY,
             ),
         )
         self.update_weapon_cooldown(
             cooldown_view,
-            visible=phase in (GamePhase.AIRSTRIKE, GamePhase.GROUND_COMBAT),
+            visible=phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT),
         )
         self.update_lock(
             lock_state,
             lock_visible,
-            active=anti_air_scope_enabled and phase == GamePhase.AIRSTRIKE and weapon == WeaponKind.ANTI_AIRCRAFT,
+            active=anti_air_scope_enabled and phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT) and weapon == WeaponKind.ANTI_AIRCRAFT,
             progress=lock_progress,
             target_position=lock_target_position,
             target_radius=lock_target_radius,
@@ -963,10 +1017,10 @@ class GameHUD:
 
         for kind, slot in self.inventory_slots.items():
             usable = (
-                kind == WeaponKind.ANTI_AIRCRAFT and phase == GamePhase.AIRSTRIKE
+                kind == WeaponKind.ANTI_AIRCRAFT and phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
             ) or (
                 kind in (WeaponKind.SNIPER, WeaponKind.PISTOL)
-                and phase == GamePhase.GROUND_COMBAT
+                and phase in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
             )
             selected = kind == selected_weapon
             panel = slot["panel"]
