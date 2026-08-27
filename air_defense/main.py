@@ -12,6 +12,7 @@ from . import config
 from .entities import (
     Aircraft,
     AntiAircraftGun,
+    GuidedMissile,
     GroundEncounter,
     Pistol,
     Player,
@@ -25,6 +26,7 @@ from .rules import (
     advance_crew_behavior,
     apply_city_damage,
     apply_enemy_hit,
+    apply_guided_missile_damage,
     can_fire_anti_air,
     can_fire_pistol,
     can_fire_sniper,
@@ -70,6 +72,9 @@ class AirDefenseGame:
         self._fps_sample_elapsed = 0.0
         self._fps_sample_frames = 0
         self._fps_value: Optional[float] = None
+        self.active_missiles: dict[str, GuidedMissile] = {}
+        self._missile_sequence = 0
+        self._aircraft_screen_target = None
 
         self.hud.bind_menu_actions(self.start_game, self.quit_game)
         self.hud.bind_return_action(self.return_to_menu)
@@ -87,8 +92,9 @@ class AirDefenseGame:
         self.anti_aircraft = AntiAircraftGun(world_position=config.DEFENSE_POINT_POSITION)
         self.sniper = SniperRifle(world_position=config.WEAPON_RACK_POSITION)
         self.pistol = Pistol(world_position=config.WEAPON_RACK_POSITION)
-        self.lock_tracker.reset()
+        self._reset_airstrike_guidance(clear_missiles=True)
         self.encounter = None
+        self._aircraft_screen_target = None
         self._game_over_presented = False
         self._hit_feedback_seconds = 0.0
         self._fps_sample_elapsed = 0.0
@@ -115,7 +121,8 @@ class AirDefenseGame:
         self.anti_aircraft = None
         self.sniper = None
         self.pistol = None
-        self.lock_tracker.reset()
+        self._reset_airstrike_guidance(clear_missiles=True)
+        self._aircraft_screen_target = None
         self.scene.set_scope_enabled(False)
         self._game_over_presented = False
         self.hud.show_main_menu()
@@ -159,7 +166,7 @@ class AirDefenseGame:
         elif key == "left mouse down":
             self._fire_current_weapon()
         elif key == "right mouse down":
-            self._toggle_sniper_scope()
+            self._toggle_scope()
 
     def update(self) -> None:
         """Run the explicit per-frame order described by the implementation plan."""
@@ -201,6 +208,107 @@ class AirDefenseGame:
         if self.pistol is not None:
             self.pistol.update_cooldown(delta_seconds)
 
+    def _reset_airstrike_guidance(self, *, clear_missiles: bool) -> None:
+        """Reset lock/target state and optionally remove active target-bound missiles."""
+
+        self.lock_tracker.set_scope_enabled(False)
+        self.session.reset_airstrike_guidance(clear_missiles=clear_missiles)
+        if self.anti_aircraft is not None:
+            self.anti_aircraft.lock_state = LockState.WHITE
+            self.anti_aircraft.lock_elapsed = 0.0
+            self.anti_aircraft.target_aircraft_id = None
+            self.anti_aircraft.target_in_zone = False
+        if clear_missiles:
+            self._clear_active_missiles()
+            self._missile_sequence = 0
+
+    def _clear_active_missiles(self) -> None:
+        """Remove every visual/domain missile before a target/session boundary."""
+
+        for missile_id in tuple(self.active_missiles):
+            self.scene.remove_guided_missile(missile_id)
+        self.active_missiles.clear()
+        self.session.active_missile_ids.clear()
+
+    def _reset_lock_after_shot(self) -> None:
+        """Require a fresh full lock after each valid missile launch."""
+
+        self.lock_tracker.reset()
+        self.session.lock_state = LockState.WHITE
+        self.session.lock_elapsed = 0.0
+        self.session.target_in_zone = False
+        if self.anti_aircraft is not None:
+            self.anti_aircraft.lock_state = LockState.WHITE
+            self.anti_aircraft.lock_elapsed = 0.0
+            self.anti_aircraft.target_aircraft_id = None
+            self.anti_aircraft.target_in_zone = False
+
+    def _update_active_missiles(self, delta_seconds: float) -> bool:
+        """Advance missiles in insertion order; return true if the aircraft became terminal."""
+
+        if self.aircraft is None:
+            self._clear_active_missiles()
+            return False
+        aircraft = self.aircraft
+        for missile_id, missile in tuple(self.active_missiles.items()):
+            if missile.target_aircraft_id != aircraft.id:
+                self.scene.remove_guided_missile(missile_id)
+                self.active_missiles.pop(missile_id, None)
+                self.session.active_missile_ids.discard(missile_id)
+                continue
+
+            step = missile.advance(delta_seconds, aircraft.position)
+            self.scene.update_guided_missile(missile)
+            if step.hit:
+                destroyed = apply_guided_missile_damage(
+                    aircraft,
+                    missile,
+                    step,
+                    active_aircraft_id=self.session.active_aircraft_id,
+                )
+                self.scene.remove_guided_missile(missile_id, explode=True)
+                self.active_missiles.pop(missile_id, None)
+                self.session.active_missile_ids.discard(missile_id)
+                self._hit_feedback_seconds = 0.6
+                if destroyed:
+                    self._on_aircraft_destroyed()
+                    return True
+            elif step.expired:
+                self.scene.remove_guided_missile(missile_id)
+                self.active_missiles.pop(missile_id, None)
+                self.session.active_missile_ids.discard(missile_id)
+        return False
+
+    def _on_aircraft_destroyed(self) -> None:
+        """Resolve the active aircraft transition once after collision-time damage."""
+
+        if self.aircraft is None:
+            return
+        aircraft = self.aircraft
+        aircraft_id = aircraft.id
+        aircraft_type = aircraft.aircraft_type
+        self._reset_airstrike_guidance(clear_missiles=True)
+        self.scene.remove_aircraft(crash=False)
+        self.scene.set_scope_enabled(False)
+        self._aircraft_screen_target = None
+        outcome = resolve_aircraft_outcome(
+            self.session,
+            aircraft_id=aircraft_id,
+            outcome="destroyed",
+        )
+        if not outcome.success:
+            return
+        self.aircraft = None
+        self.encounter = self.encounter_factory.create_for_aircraft(
+            aircraft_id,
+            aircraft_type,
+        )
+        if self.scene.world is not None:
+            self.scene.world.sniper_pickup.enabled = True
+        self.scene.create_crew(self.encounter)
+        if self.encounter.cleared:
+            self._complete_encounter()
+
     def _update_airstrike(self, delta_seconds: float) -> None:
         if self.aircraft is None:
             return
@@ -211,6 +319,7 @@ class AirDefenseGame:
             if self.aircraft.phase in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED):
                 return
             self.aircraft.impact()
+            self._clear_active_missiles()
             self.session.transition(
                 SessionEvent.BUILDING_IMPACT,
                 aircraft_id=self.aircraft.id,
@@ -219,15 +328,34 @@ class AirDefenseGame:
             self._present_game_over()
             return
 
+        # The aircraft has survived the approach step, so process active
+        # missiles against its current position before recomputing lock/HUD.
+        if self._update_active_missiles(delta_seconds):
+            self._aircraft_screen_target = None
+            return
+
         has_anti_air = self.session.held_weapon == WeaponKind.ANTI_AIRCRAFT
-        target_visible = has_anti_air and self.scene.aircraft_is_visible(self.scene.aircraft_entity)
-        lock_state = self.lock_tracker.update(target_visible, delta_seconds)
+        target_projection = self.scene.project_aircraft_target(self.scene.aircraft_entity)
+        if has_anti_air and self.session.anti_air_scope_enabled:
+            self.scene.apply_aircraft_aim_assist(target_projection, delta_seconds)
+            target_projection = self.scene.project_aircraft_target(self.scene.aircraft_entity)
+        self._aircraft_screen_target = target_projection
+        target_in_zone = bool(
+            has_anti_air
+            and self.session.anti_air_scope_enabled
+            and target_projection is not None
+            and target_projection.in_lock_zone
+        )
+        self.lock_tracker.set_scope_enabled(self.session.anti_air_scope_enabled)
+        lock_state = self.lock_tracker.update(target_in_zone, delta_seconds)
         if self.anti_aircraft is not None:
             self.anti_aircraft.lock_state = lock_state
             self.anti_aircraft.lock_elapsed = self.lock_tracker.lock_elapsed
-            self.anti_aircraft.target_aircraft_id = self.aircraft.id if target_visible else None
+            self.anti_aircraft.target_aircraft_id = self.aircraft.id if target_in_zone else None
+            self.anti_aircraft.target_in_zone = target_in_zone
         self.session.lock_state = lock_state
         self.session.lock_elapsed = self.lock_tracker.lock_elapsed
+        self.session.target_in_zone = self.lock_tracker.target_in_zone
         if lock_state == LockState.GREEN_READY:
             self.aircraft.mark_locked()
 
@@ -313,9 +441,7 @@ class AirDefenseGame:
 
         self.session.held_weapon = requested_weapon
         if requested_weapon == WeaponKind.ANTI_AIRCRAFT:
-            self.lock_tracker.reset()
-            self.session.lock_state = LockState.WHITE
-            self.session.lock_elapsed = 0.0
+            self._reset_airstrike_guidance(clear_missiles=False)
             if self.scene.world is not None:
                 self.scene.world.anti_aircraft_pickup.enabled = False
         elif requested_weapon == WeaponKind.SNIPER:
@@ -344,6 +470,7 @@ class AirDefenseGame:
         self.player.held_weapon = None
         self.player.aim_mode = "NONE"
         self.session.held_weapon = None
+        self._reset_airstrike_guidance(clear_missiles=False)
         self.scene.set_scope_enabled(False)
 
     def _drop_weapon(self) -> None:
@@ -359,9 +486,7 @@ class AirDefenseGame:
         if kind == WeaponKind.ANTI_AIRCRAFT:
             self.anti_aircraft = AntiAircraftGun(world_position=drop_position)
             self.scene.move_weapon_pickup("anti_aircraft", drop_position)
-            self.lock_tracker.reset()
-            self.session.lock_state = LockState.WHITE
-            self.session.lock_elapsed = 0.0
+            self._reset_airstrike_guidance(clear_missiles=False)
         elif kind == WeaponKind.SNIPER:
             self.sniper = SniperRifle(world_position=drop_position)
             self.scene.move_weapon_pickup("sniper", drop_position)
@@ -369,6 +494,22 @@ class AirDefenseGame:
         elif kind == WeaponKind.PISTOL:
             self.pistol = Pistol(world_position=drop_position)
             self.scene.set_scope_enabled(False)
+
+    def _toggle_scope(self) -> None:
+        if self.session.held_weapon == WeaponKind.ANTI_AIRCRAFT:
+            self._toggle_anti_air_scope()
+        else:
+            self._toggle_sniper_scope()
+
+    def _toggle_anti_air_scope(self) -> None:
+        if self.session.held_weapon != WeaponKind.ANTI_AIRCRAFT or self.anti_aircraft is None:
+            return
+        enabled = not self.session.anti_air_scope_enabled
+        self.session.set_anti_air_scope(enabled)
+        self.lock_tracker.set_scope_enabled(enabled)
+        self.scene.set_scope_enabled(enabled, anti_air=True)
+        if not enabled:
+            self._reset_airstrike_guidance(clear_missiles=False)
 
     def _toggle_sniper_scope(self) -> None:
         if self.session.held_weapon != WeaponKind.SNIPER or self.sniper is None:
@@ -399,42 +540,32 @@ class AirDefenseGame:
             self.session.phase != GamePhase.AIRSTRIKE
             or self.aircraft is None
             or self.anti_aircraft is None
+            or not self.session.anti_air_scope_enabled
+            or self.anti_aircraft.target_aircraft_id != self.aircraft.id
         ):
             return
         if not can_fire_anti_air(
             self.anti_aircraft.lock_state,
             self.anti_aircraft.fire_cooldown,
             self.session.held_weapon,
+            target_in_zone=self.session.target_in_zone,
         ):
             return
-        aircraft_destroyed = self.aircraft.take_damage(1)
+
+        self._missile_sequence += 1
+        missile_id = f"{self.aircraft.id}-missile-{self._missile_sequence:03d}"
+        missile_start = camera.world_position + camera.forward * 1.5
+        missile = GuidedMissile(
+            id=missile_id,
+            target_aircraft_id=self.aircraft.id,
+            position=(float(missile_start.x), float(missile_start.y), float(missile_start.z)),
+            forward=(float(camera.forward.x), float(camera.forward.y), float(camera.forward.z)),
+        )
+        self.active_missiles[missile_id] = missile
+        self.session.active_missile_ids.add(missile_id)
+        self.scene.create_guided_missile(missile)
         self.anti_aircraft.mark_fired()
-        self.lock_tracker.reset()
-        self.session.lock_state = LockState.WHITE
-        self.session.lock_elapsed = 0.0
-        if not aircraft_destroyed:
-            self._hit_feedback_seconds = 0.35
-            return
-        aircraft_id = self.aircraft.id
-        aircraft_type = self.aircraft.aircraft_type
-        self.scene.remove_aircraft(crash=True)
-        outcome = resolve_aircraft_outcome(
-            self.session,
-            aircraft_id=aircraft_id,
-            outcome="destroyed",
-        )
-        if not outcome.success:
-            return
-        self.aircraft = None
-        self.encounter = self.encounter_factory.create_for_aircraft(
-            aircraft_id,
-            aircraft_type,
-        )
-        if self.scene.world is not None:
-            self.scene.world.sniper_pickup.enabled = True
-        self.scene.create_crew(self.encounter)
-        if self.encounter.cleared:
-            self._complete_encounter()
+        self._reset_lock_after_shot()
 
     def _fire_sniper(self) -> None:
         if (
@@ -500,6 +631,7 @@ class AirDefenseGame:
     def _complete_encounter(self) -> None:
         if self.encounter is None:
             return
+        self._reset_airstrike_guidance(clear_missiles=True)
         encounter_id = self.encounter.id
         next_plan = (
             self.wave_director.plan_wave(self.session.wave.wave_number + 1)
@@ -511,10 +643,11 @@ class AirDefenseGame:
             encounter_id=encounter_id,
             wave_plan=next_plan,
         )
-        self.scene.clear_dynamic()
+        self.scene.clear_dynamic(clear_effects=False)
         self.encounter = None
         self.aircraft = None
-        self.lock_tracker.reset()
+        self._aircraft_screen_target = None
+        self.lock_tracker.set_scope_enabled(False)
         if self.sniper is not None:
             self.sniper.scope_enabled = False
         self.scene.set_scope_enabled(False)
@@ -533,6 +666,8 @@ class AirDefenseGame:
         if self.session.phase != GamePhase.GAME_OVER or self._game_over_presented:
             return
         self._game_over_presented = True
+        self._reset_airstrike_guidance(clear_missiles=True)
+        self._aircraft_screen_target = None
         self.scene.set_gameplay_enabled(False)
         self.scene.set_scope_enabled(False)
         self.hud.show_game_over(self.session.stats)
@@ -540,13 +675,20 @@ class AirDefenseGame:
     def _refresh_hud(self) -> None:
         if self.session.phase == GamePhase.AIRSTRIKE:
             visible = self.lock_tracker.flash_visible()
-            self.hud.update_lock(
-                self.session.lock_state,
-                visible,
-                active=self.session.held_weapon == WeaponKind.ANTI_AIRCRAFT,
+            target_position = (
+                self._aircraft_screen_target.hud_position
+                if self._aircraft_screen_target is not None
+                else None
+            )
+            target_radius = (
+                self._aircraft_screen_target.screen_radius
+                if self._aircraft_screen_target is not None
+                else 0.008
             )
         else:
-            self.hud.update_lock(LockState.WHITE, True, active=False)
+            visible = True
+            target_position = None
+            target_radius = 0.008
 
         prompt = ""
         if self.session.phase == GamePhase.AIRSTRIKE:
@@ -614,6 +756,16 @@ class AirDefenseGame:
                 and self.sniper is not None
                 and self.sniper.scope_enabled
             ),
+            anti_air_scope_enabled=(
+                self.session.phase == GamePhase.AIRSTRIKE
+                and self.session.held_weapon == WeaponKind.ANTI_AIRCRAFT
+                and self.session.anti_air_scope_enabled
+            ),
+            lock_state=self.session.lock_state,
+            lock_visible=visible,
+            lock_progress=self.lock_tracker.progress,
+            lock_target_position=target_position,
+            lock_target_radius=target_radius,
             fps=self._fps_value,
             wave_number=self.session.wave.wave_number,
             aircraft_index=self.session.wave.aircraft_index,

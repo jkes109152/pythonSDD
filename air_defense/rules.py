@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from math import ceil, sqrt
+from math import acos, asin, atan2, ceil, cos, degrees, hypot, pi, radians, sin, sqrt
 from typing import TYPE_CHECKING, Optional, Protocol
 
 from . import config
@@ -13,11 +13,16 @@ from .config import (
     CREW_ADVANCE_INTERVAL_SECONDS,
     ENCOUNTER_MAX_CREW,
     ENCOUNTER_MIN_CREW,
+    AA_AIM_ASSIST_MAX_DEGREES_PER_SECOND,
+    AA_AIM_ASSIST_ZONE_MULTIPLIER,
+    AA_LOCK_DECAY_SECONDS,
+    AA_LOCK_ZONE_DIAMETER_RATIO,
     LOCK_DURATION_SECONDS,
     LOCK_FLASH_HALF_PERIOD_SECONDS,
 )
 from .state import (
     CrewBehaviorState,
+    AircraftPhase,
     AircraftType,
     GamePhase,
     GameSession,
@@ -38,36 +43,378 @@ class RandomSource(Protocol):
 
 
 class LockOnTracker:
-    """Accumulates only uninterrupted visible target time."""
+    """Accumulates an in-zone target while the anti-air scope is open."""
 
-    def __init__(self, lock_duration: float = LOCK_DURATION_SECONDS) -> None:
-        self.lock_duration = lock_duration
+    def __init__(
+        self,
+        lock_duration: float = LOCK_DURATION_SECONDS,
+        decay_duration: float = AA_LOCK_DECAY_SECONDS,
+        *,
+        scope_enabled: bool = False,
+    ) -> None:
+        self.lock_duration = max(1e-6, float(lock_duration))
+        self.decay_duration = max(1e-6, float(decay_duration))
         self.lock_elapsed = 0.0
         self.state = LockState.WHITE
+        self.target_in_zone = False
+        self.scope_enabled = bool(scope_enabled)
 
-    def update(self, target_visible: bool, delta_seconds: float) -> LockState:
-        if not target_visible:
+    @property
+    def progress(self) -> float:
+        """Return the clamped UI progress value in the inclusive [0, 1] range."""
+
+        return max(0.0, min(1.0, self.lock_elapsed / self.lock_duration))
+
+    def set_scope_enabled(self, enabled: bool) -> None:
+        """Open/close the anti-air scope and apply its immediate-close reset rule."""
+
+        enabled = bool(enabled)
+        if not enabled:
+            self.scope_enabled = False
+            self.reset()
+            return
+        if not self.scope_enabled:
+            self.reset()
+        self.scope_enabled = True
+
+    def update(self, target_in_zone: bool, delta_seconds: float) -> LockState:
+        if not self.scope_enabled:
             self.reset()
             return self.state
-        self.lock_elapsed = min(
-            self.lock_duration,
-            self.lock_elapsed + max(0.0, delta_seconds),
-        )
-        self.state = (
-            LockState.GREEN_READY
-            if self.lock_elapsed >= self.lock_duration
-            else LockState.RED_TRACKING
-        )
+
+        delta_seconds = max(0.0, float(delta_seconds))
+        self.target_in_zone = bool(target_in_zone)
+        if self.target_in_zone:
+            self.lock_elapsed = min(self.lock_duration, self.lock_elapsed + delta_seconds)
+        else:
+            decay_rate = self.lock_duration / self.decay_duration
+            self.lock_elapsed = max(0.0, self.lock_elapsed - delta_seconds * decay_rate)
+
+        if self.lock_elapsed <= 0.0:
+            self.lock_elapsed = 0.0
+            self.state = LockState.WHITE
+        elif self.lock_elapsed >= self.lock_duration and self.target_in_zone:
+            self.lock_elapsed = self.lock_duration
+            self.state = LockState.GREEN_READY
+        else:
+            self.state = LockState.RED_TRACKING
         return self.state
 
     def reset(self) -> None:
         self.lock_elapsed = 0.0
         self.state = LockState.WHITE
+        self.target_in_zone = False
 
     def flash_visible(self, half_period: float = LOCK_FLASH_HALF_PERIOD_SECONDS) -> bool:
         if self.state != LockState.RED_TRACKING or half_period <= 0:
             return self.state == LockState.RED_TRACKING
         return int(self.lock_elapsed / half_period) % 2 == 0
+
+
+Vector3 = tuple[float, float, float]
+Vector2 = tuple[float, float]
+
+
+def vector_length(vector: Vector3) -> float:
+    return sqrt(sum(float(component) ** 2 for component in vector))
+
+
+def normalize_vector(vector: Vector3) -> Vector3:
+    """Normalize a vector; an explicit zero vector remains zero."""
+
+    length = vector_length(vector)
+    if length <= 1e-9:
+        return (0.0, 0.0, 0.0)
+    return tuple(float(component) / length for component in vector)  # type: ignore[return-value]
+
+
+def _dot(first: Vector3, second: Vector3) -> float:
+    return sum(left * right for left, right in zip(first, second))
+
+
+def _cross(first: Vector3, second: Vector3) -> Vector3:
+    return (
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    )
+
+
+def _clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def wrap_angle_degrees(angle: float) -> float:
+    """Wrap an angle to [-180, 180), including the 180-degree boundary."""
+
+    wrapped = (float(angle) + 180.0) % 360.0 - 180.0
+    return 180.0 if wrapped == -180.0 else wrapped
+
+
+def clamp_angle_delta(target_angle: float, current_angle: float, maximum_delta: float) -> float:
+    """Move an angle toward a target by no more than maximum_delta degrees."""
+
+    maximum_delta = max(0.0, float(maximum_delta))
+    difference = wrap_angle_degrees(target_angle - current_angle)
+    return current_angle + _clamp(difference, -maximum_delta, maximum_delta)
+
+
+def direction_to_yaw_pitch(direction: Vector3) -> tuple[float, float]:
+    normalized = normalize_vector(direction)
+    if normalized == (0.0, 0.0, 0.0):
+        return 0.0, 0.0
+    yaw = degrees(atan2(normalized[0], normalized[2]))
+    pitch = degrees(asin(_clamp(normalized[1], -1.0, 1.0)))
+    return yaw, pitch
+
+
+def yaw_pitch_to_direction(yaw: float, pitch: float) -> Vector3:
+    yaw_radians = radians(yaw)
+    pitch_radians = radians(_clamp(pitch, -89.999, 89.999))
+    return normalize_vector(
+        (
+            sin(yaw_radians) * cos(pitch_radians),
+            sin(pitch_radians),
+            cos(yaw_radians) * cos(pitch_radians),
+        )
+    )
+
+
+def steer_forward(
+    current_forward: Vector3,
+    desired_forward: Vector3,
+    *,
+    max_yaw_degrees: float,
+    max_pitch_degrees: float,
+) -> Vector3:
+    """Turn a heading with independent bounded yaw and pitch deltas."""
+
+    current = normalize_vector(current_forward)
+    desired = normalize_vector(desired_forward)
+    if desired == (0.0, 0.0, 0.0):
+        return current
+    if current == (0.0, 0.0, 0.0):
+        return desired
+    current_yaw, current_pitch = direction_to_yaw_pitch(current)
+    desired_yaw, desired_pitch = direction_to_yaw_pitch(desired)
+    return yaw_pitch_to_direction(
+        clamp_angle_delta(desired_yaw, current_yaw, max_yaw_degrees),
+        clamp_angle_delta(desired_pitch, current_pitch, max_pitch_degrees),
+    )
+
+
+def rotate_direction_towards(
+    current_direction: Vector3,
+    target_direction: Vector3,
+    maximum_angle_degrees: float,
+) -> Vector3:
+    """Rotate a direction by a bounded total angular amount."""
+
+    current = normalize_vector(current_direction)
+    target = normalize_vector(target_direction)
+    if target == (0.0, 0.0, 0.0):
+        return current
+    if current == (0.0, 0.0, 0.0):
+        return target
+    maximum_angle = max(0.0, float(maximum_angle_degrees))
+    cosine = _clamp(_dot(current, target), -1.0, 1.0)
+    angle = acos(cosine)
+    if angle <= radians(maximum_angle) + 1e-9:
+        return target
+    if angle <= 1e-9:
+        return current
+    axis = _cross(current, target)
+    axis_length = vector_length(axis)
+    if axis_length <= 1e-9:
+        axis = _cross(current, (0.0, 1.0, 0.0))
+        if vector_length(axis) <= 1e-9:
+            axis = _cross(current, (1.0, 0.0, 0.0))
+        axis = normalize_vector(axis)
+        angle_to_apply = min(angle, radians(maximum_angle))
+        # Rodrigues rotation around the perpendicular axis.
+        cosine_step = cos(angle_to_apply)
+        sine_step = sin(angle_to_apply)
+        rotated = tuple(
+            current[index] * cosine_step
+            + _cross(axis, current)[index] * sine_step
+            for index in range(3)
+        )
+        return normalize_vector(rotated)  # type: ignore[arg-type]
+
+    axis = normalize_vector(axis)
+    angle_to_apply = min(angle, radians(maximum_angle))
+    cosine_step = cos(angle_to_apply)
+    sine_step = sin(angle_to_apply)
+    cross_term = _cross(axis, current)
+    rotated = tuple(
+        current[index] * cosine_step + cross_term[index] * sine_step
+        for index in range(3)
+    )
+    return normalize_vector(rotated)  # type: ignore[arg-type]
+
+
+def desired_aircraft_heading(
+    position: Vector3,
+    target_position: Vector3,
+    *,
+    evasion_phase: float,
+    evasion_amplitude: float,
+    evasion_frequency: float,
+) -> Vector3:
+    """Return a forward heading that bends toward a deterministic evasion wave."""
+
+    base = normalize_vector(tuple(target - current for current, target in zip(position, target_position)))
+    if base == (0.0, 0.0, 0.0):
+        return base
+    world_up = (0.0, 1.0, 0.0)
+    lateral = normalize_vector(_cross(world_up, base))
+    if lateral == (0.0, 0.0, 0.0):
+        lateral = normalize_vector(_cross((1.0, 0.0, 0.0), base))
+    vertical = normalize_vector(_cross(base, lateral))
+    phase = evasion_phase * evasion_frequency * 2.0 * pi
+    offset = tuple(
+        lateral[index] * sin(phase) + vertical[index] * 0.35 * cos(phase)
+        for index in range(3)
+    )
+    distance = max(1.0, vector_length(tuple(target - current for current, target in zip(position, target_position))))
+    bend = max(0.0, float(evasion_amplitude)) / max(1.0, distance * 0.35)
+    return normalize_vector(tuple(base[index] + offset[index] * bend for index in range(3)))
+
+
+def lock_zone_radius(
+    viewport_width: float,
+    viewport_height: float,
+    diameter_ratio: float = AA_LOCK_ZONE_DIAMETER_RATIO,
+) -> float:
+    """Return the hidden lock-circle radius in viewport pixels."""
+
+    width = max(0.0, float(viewport_width))
+    height = max(0.0, float(viewport_height))
+    ratio = max(0.0, float(diameter_ratio))
+    return min(width, height) * ratio * 0.5
+
+
+def screen_distance_from_center(
+    screen_position: Vector2,
+    viewport_width: float,
+    viewport_height: float,
+) -> float:
+    """Measure an absolute pixel position from the viewport center."""
+
+    width = float(viewport_width)
+    height = float(viewport_height)
+    if width <= 0.0 or height <= 0.0:
+        return float("inf")
+    return hypot(float(screen_position[0]) - width * 0.5, float(screen_position[1]) - height * 0.5)
+
+
+def is_inside_lock_zone(
+    screen_position: Vector2,
+    viewport_width: float,
+    viewport_height: float,
+    diameter_ratio: float = AA_LOCK_ZONE_DIAMETER_RATIO,
+) -> bool:
+    radius = lock_zone_radius(viewport_width, viewport_height, diameter_ratio)
+    return screen_distance_from_center(screen_position, viewport_width, viewport_height) <= radius + 1e-6
+
+
+def raycast_hit_matches_target(hit_result: object, target: object) -> bool:
+    """Resolve an engine raycast wrapper and match its entity parent chain."""
+
+    if hit_result is None or target is None or not bool(getattr(hit_result, "hit", False)):
+        return False
+    target_id = getattr(target, "aircraft_id", None)
+    current = getattr(hit_result, "entity", None)
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        if current is target:
+            return True
+        if target_id is not None and getattr(current, "aircraft_id", None) == target_id:
+            return True
+        current = getattr(current, "parent", None)
+    return False
+
+
+def clamp_screen_radius(radius: float, *, minimum: float = 0.008, maximum: float = 0.2) -> float:
+    """Keep a projected target radius readable and finite for the HUD."""
+
+    return _clamp(float(radius), max(0.0, minimum), max(max(0.0, minimum), maximum))
+
+
+def tracking_ring_radius(
+    acquisition_radius: float,
+    target_radius: float,
+    progress: float,
+    *,
+    padding: float = 0.0,
+) -> float:
+    """Interpolate the tracking ring from the acquisition circle to the target."""
+
+    start = max(0.0, float(acquisition_radius))
+    end = max(0.0, float(target_radius) + float(padding))
+    amount = _clamp(float(progress), 0.0, 1.0)
+    return start + (end - start) * amount
+
+
+def apply_aim_assist(
+    current_direction: Vector3,
+    target_direction: Vector3,
+    *,
+    scope_enabled: bool,
+    target_visible: bool,
+    target_screen_distance: float,
+    lock_zone_radius_pixels: float,
+    delta_seconds: float,
+    activation_multiplier: float = AA_AIM_ASSIST_ZONE_MULTIPLIER,
+    maximum_degrees_per_second: float = AA_AIM_ASSIST_MAX_DEGREES_PER_SECOND,
+) -> Vector3:
+    """Apply small scope-only attraction after player mouse rotation."""
+
+    current = normalize_vector(current_direction)
+    if not scope_enabled or not target_visible:
+        return current
+    activation_radius = max(0.0, float(lock_zone_radius_pixels)) * max(0.0, float(activation_multiplier))
+    if float(target_screen_distance) > activation_radius + 1e-6:
+        return current
+    maximum_degrees = max(0.0, float(maximum_degrees_per_second)) * max(0.0, float(delta_seconds))
+    return rotate_direction_towards(current, target_direction, maximum_degrees)
+
+
+def distance_point_to_segment(
+    point: Vector3,
+    segment_start: Vector3,
+    segment_end: Vector3,
+) -> float:
+    """Return the shortest distance from a point to a finite 3D segment."""
+
+    segment = tuple(end - start for start, end in zip(segment_start, segment_end))
+    length_squared = _dot(segment, segment)
+    if length_squared <= 1e-12:
+        return vector_length(tuple(value - start for value, start in zip(point, segment_start)))
+    offset = tuple(value - start for value, start in zip(point, segment_start))
+    amount = _clamp(_dot(offset, segment) / length_squared, 0.0, 1.0)
+    closest = tuple(segment_start[index] + segment[index] * amount for index in range(3))
+    return vector_length(tuple(value - candidate for value, candidate in zip(point, closest)))
+
+
+def swept_segment_hits_sphere(
+    segment_start: Vector3,
+    segment_end: Vector3,
+    sphere_center: Vector3,
+    sphere_radius: float,
+) -> bool:
+    """Test a swept missile segment against the target's current hit sphere."""
+
+    radius = max(0.0, sphere_radius)
+    start_inside = vector_length(
+        tuple(start - center for start, center in zip(segment_start, sphere_center))
+    ) <= radius + 1e-9
+    return start_inside or distance_point_to_segment(
+        sphere_center,
+        segment_start,
+        segment_end,
+    ) <= radius + 1e-9
 
 
 def warning_active(
@@ -116,12 +463,41 @@ def can_fire_anti_air(
     lock_state: LockState,
     cooldown_remaining: float,
     held_weapon: Optional[WeaponKind] = WeaponKind.ANTI_AIRCRAFT,
+    target_in_zone: bool = False,
 ) -> bool:
     return (
         held_weapon == WeaponKind.ANTI_AIRCRAFT
         and lock_state == LockState.GREEN_READY
         and cooldown_ready(cooldown_remaining)
+        and bool(target_in_zone)
     )
+
+
+def apply_guided_missile_damage(
+    aircraft: object,
+    missile: object,
+    step: object,
+    *,
+    active_aircraft_id: Optional[str],
+    damage: int = 1,
+) -> bool:
+    """Apply one collision-time hit after validating target identity and phase."""
+
+    if not bool(getattr(step, "hit", False)):
+        return False
+    if bool(getattr(missile, "damage_applied", False)):
+        return False
+    aircraft_id = getattr(aircraft, "id", None)
+    target_id = getattr(missile, "target_aircraft_id", None)
+    if active_aircraft_id is None or aircraft_id != active_aircraft_id or target_id != active_aircraft_id:
+        return False
+    if getattr(aircraft, "phase", None) in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED):
+        return False
+    take_damage = getattr(aircraft, "take_damage", None)
+    if take_damage is None or damage <= 0:
+        return False
+    setattr(missile, "damage_applied", True)
+    return bool(take_damage(damage))
 
 
 def can_fire_sniper(
@@ -198,6 +574,8 @@ class AircraftProfile:
     flight_duration: float
     evasion_amplitude: float
     evasion_frequency: float
+    max_yaw_rate: float = 0.0
+    max_pitch_rate: float = 0.0
 
 
 def aircraft_profile(aircraft_type: AircraftType) -> AircraftProfile:
@@ -211,6 +589,8 @@ def aircraft_profile(aircraft_type: AircraftType) -> AircraftProfile:
             config.AIRCRAFT_NORMAL_FLIGHT_DURATION_SECONDS,
             config.AIRCRAFT_NORMAL_EVASION_AMPLITUDE,
             config.AIRCRAFT_NORMAL_EVASION_FREQUENCY,
+            config.AIRCRAFT_NORMAL_MAX_YAW_RATE_DEGREES,
+            config.AIRCRAFT_NORMAL_MAX_PITCH_RATE_DEGREES,
         ),
         AircraftType.MANPOWER_SUPPORT: AircraftProfile(
             aircraft_type,
@@ -218,6 +598,8 @@ def aircraft_profile(aircraft_type: AircraftType) -> AircraftProfile:
             config.AIRCRAFT_SUPPORT_FLIGHT_DURATION_SECONDS,
             config.AIRCRAFT_SUPPORT_EVASION_AMPLITUDE,
             config.AIRCRAFT_SUPPORT_EVASION_FREQUENCY,
+            config.AIRCRAFT_SUPPORT_MAX_YAW_RATE_DEGREES,
+            config.AIRCRAFT_SUPPORT_MAX_PITCH_RATE_DEGREES,
         ),
         AircraftType.FAST: AircraftProfile(
             aircraft_type,
@@ -225,6 +607,8 @@ def aircraft_profile(aircraft_type: AircraftType) -> AircraftProfile:
             config.AIRCRAFT_FAST_FLIGHT_DURATION_SECONDS,
             config.AIRCRAFT_FAST_EVASION_AMPLITUDE,
             config.AIRCRAFT_FAST_EVASION_FREQUENCY,
+            config.AIRCRAFT_FAST_MAX_YAW_RATE_DEGREES,
+            config.AIRCRAFT_FAST_MAX_PITCH_RATE_DEGREES,
         ),
         AircraftType.ARMORED_BOSS: AircraftProfile(
             aircraft_type,
@@ -232,6 +616,8 @@ def aircraft_profile(aircraft_type: AircraftType) -> AircraftProfile:
             config.AIRCRAFT_ARMORED_FLIGHT_DURATION_SECONDS,
             config.AIRCRAFT_ARMORED_EVASION_AMPLITUDE,
             config.AIRCRAFT_ARMORED_EVASION_FREQUENCY,
+            config.AIRCRAFT_ARMORED_MAX_YAW_RATE_DEGREES,
+            config.AIRCRAFT_ARMORED_MAX_PITCH_RATE_DEGREES,
         ),
     }
     return profiles[aircraft_type]

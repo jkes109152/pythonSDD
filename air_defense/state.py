@@ -192,6 +192,9 @@ class GameSession:
     held_weapon: Optional[WeaponKind] = None
     lock_state: LockState = LockState.WHITE
     lock_elapsed: float = 0.0
+    anti_air_scope_enabled: bool = False
+    target_in_zone: bool = False
+    active_missile_ids: set[str] = field(default_factory=set)
     active_aircraft_id: Optional[str] = None
     active_encounter_id: Optional[str] = None
     aircraft_sequence: int = 0
@@ -206,8 +209,7 @@ class GameSession:
         self.phase = GamePhase.AIRSTRIKE
         self.health = self.max_health
         self.held_weapon = None
-        self.lock_state = LockState.WHITE
-        self.lock_elapsed = 0.0
+        self.reset_airstrike_guidance()
         self.active_encounter_id = None
         self.city_health = self.max_city_health
         self.wave = wave_plan.to_progress() if wave_plan is not None else WaveProgress()
@@ -253,8 +255,7 @@ class GameSession:
             self._processed_events.add(key)
             self.stats.record_once(key, "aircraft_destroyed")
             self.active_encounter_id = f"encounter:{target_id}"
-            self.lock_state = LockState.WHITE
-            self.lock_elapsed = 0.0
+            self.reset_airstrike_guidance()
             self.phase = GamePhase.GROUND_COMBAT
             return self.phase
 
@@ -268,6 +269,7 @@ class GameSession:
                 return self.phase
             self._processed_events.add(key)
             self.stats.record_once(key, "building_impact")
+            self.reset_airstrike_guidance()
             self.phase = GamePhase.GAME_OVER
             return self.phase
 
@@ -299,6 +301,7 @@ class GameSession:
             self.aircraft_sequence += 1
             self.active_aircraft_id = self._aircraft_id(self.aircraft_sequence)
             self.active_aircraft_type = self.wave.active_aircraft_type
+            self.reset_airstrike_guidance()
             self.phase = GamePhase.AIRSTRIKE
             return self.phase
 
@@ -311,6 +314,7 @@ class GameSession:
             self._processed_events.add(key)
             self.health = 0
             self.stats.record_once(key, "player_dead")
+            self.reset_airstrike_guidance()
             self.phase = GamePhase.GAME_OVER
             return self.phase
 
@@ -323,6 +327,7 @@ class GameSession:
             self._processed_events.add(key)
             self.city_health = 0.0
             self.stats.record_once(key, "city_destroyed")
+            self.reset_airstrike_guidance()
             self.phase = GamePhase.GAME_OVER
             return self.phase
 
@@ -355,12 +360,30 @@ class GameSession:
     def can_use_anti_air(self) -> bool:
         return self.phase == GamePhase.AIRSTRIKE and self.held_weapon == WeaponKind.ANTI_AIRCRAFT
 
+    def set_anti_air_scope(self, enabled: bool) -> None:
+        """Set the anti-air scope state; closing it clears lock progress immediately."""
+
+        self.anti_air_scope_enabled = bool(enabled)
+        if not self.anti_air_scope_enabled:
+            self.lock_state = LockState.WHITE
+            self.lock_elapsed = 0.0
+            self.target_in_zone = False
+
+    def reset_airstrike_guidance(self, *, clear_missiles: bool = True) -> None:
+        """Clear transient lock/target/missile state at an airstrike boundary."""
+
+        self.anti_air_scope_enabled = False
+        self.target_in_zone = False
+        self.lock_state = LockState.WHITE
+        self.lock_elapsed = 0.0
+        if clear_missiles:
+            self.active_missile_ids.clear()
+
     def _reset_to_menu(self) -> None:
         self.phase = GamePhase.MAIN_MENU
         self.health = self.max_health
         self.held_weapon = None
-        self.lock_state = LockState.WHITE
-        self.lock_elapsed = 0.0
+        self.reset_airstrike_guidance()
         self.active_aircraft_id = None
         self.active_encounter_id = None
         self.aircraft_sequence = 0
