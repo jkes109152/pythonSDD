@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from math import acos, asin, atan2, ceil, cos, degrees, hypot, pi, radians, sin, sqrt
-from typing import TYPE_CHECKING, Optional, Protocol
+from typing import TYPE_CHECKING, Mapping, Optional, Protocol, Sequence
 
 from . import config
 from .config import (
@@ -31,6 +31,7 @@ from .state import (
     SquadRole,
     WavePlan,
     WaveProgress,
+    WaveRuntime,
     WeaponKind,
 )
 
@@ -43,7 +44,7 @@ class RandomSource(Protocol):
 
 
 class LockOnTracker:
-    """Accumulates an in-zone target while the anti-air scope is open."""
+    """Accumulates one sticky, visible target while the anti-air scope is open."""
 
     def __init__(
         self,
@@ -51,13 +52,37 @@ class LockOnTracker:
         decay_duration: float = AA_LOCK_DECAY_SECONDS,
         *,
         scope_enabled: bool = False,
+        target_aircraft_id: Optional[str] = None,
     ) -> None:
         self.lock_duration = max(1e-6, float(lock_duration))
         self.decay_duration = max(1e-6, float(decay_duration))
         self.lock_elapsed = 0.0
         self.state = LockState.WHITE
-        self.target_in_zone = False
+        self.target_aircraft_id = target_aircraft_id
+        self.target_visible = False
+        self.target_in_frame = False
         self.scope_enabled = bool(scope_enabled)
+        self.completion_flash_remaining = 0.0
+
+    @property
+    def target_in_zone(self) -> bool:
+        """Legacy alias for the original circular lock-zone boolean."""
+
+        return self.target_in_frame
+
+    @target_in_zone.setter
+    def target_in_zone(self, value: bool) -> None:
+        self.target_in_frame = bool(value)
+
+    @property
+    def fireable(self) -> bool:
+        return bool(
+            self.scope_enabled
+            and self.state == LockState.GREEN_READY
+            and self.target_aircraft_id is not None
+            and self.target_visible
+            and self.target_in_frame
+        )
 
     @property
     def progress(self) -> float:
@@ -77,14 +102,56 @@ class LockOnTracker:
             self.reset()
         self.scope_enabled = True
 
-    def update(self, target_in_zone: bool, delta_seconds: float) -> LockState:
+    def set_target(self, target_aircraft_id: Optional[str]) -> None:
+        target_aircraft_id = (
+            str(target_aircraft_id) if target_aircraft_id is not None else None
+        )
+        if target_aircraft_id != self.target_aircraft_id and self.lock_elapsed > 0.0:
+            self.lock_elapsed = 0.0
+            self.state = LockState.WHITE
+        self.target_aircraft_id = target_aircraft_id
+
+    def update(
+        self,
+        target_in_zone: bool = False,
+        delta_seconds: float = 0.0,
+        *legacy_args: object,
+        target_visible: Optional[bool] = None,
+        target_in_frame: Optional[bool] = None,
+        target_aircraft_id: Optional[str] = None,
+    ) -> LockState:
+        """Update visibility/frame membership with a linear decay buffer.
+
+        The two-argument form remains compatible with the original tests. A
+        three-positional form is also accepted as ``visible, in_frame, dt``
+        for small headless integrations.
+        """
+
+        if legacy_args:
+            if len(legacy_args) != 1:
+                raise TypeError("update accepts at most one legacy delta argument")
+            target_visible = bool(target_in_zone)
+            target_in_frame = bool(delta_seconds)
+            delta_seconds = float(legacy_args[0])
+        if target_aircraft_id is not None:
+            self.set_target(target_aircraft_id)
         if not self.scope_enabled:
             self.reset()
             return self.state
 
         delta_seconds = max(0.0, float(delta_seconds))
-        self.target_in_zone = bool(target_in_zone)
-        if self.target_in_zone:
+        self.target_visible = (
+            bool(target_in_zone) if target_visible is None else bool(target_visible)
+        )
+        self.target_in_frame = (
+            bool(target_in_zone) if target_in_frame is None else bool(target_in_frame)
+        )
+        eligible = self.target_visible and self.target_in_frame
+        self.completion_flash_remaining = max(
+            0.0,
+            self.completion_flash_remaining - delta_seconds,
+        )
+        if eligible:
             self.lock_elapsed = min(self.lock_duration, self.lock_elapsed + delta_seconds)
         else:
             decay_rate = self.lock_duration / self.decay_duration
@@ -93,8 +160,12 @@ class LockOnTracker:
         if self.lock_elapsed <= 0.0:
             self.lock_elapsed = 0.0
             self.state = LockState.WHITE
-        elif self.lock_elapsed >= self.lock_duration and self.target_in_zone:
+            if not eligible:
+                self.target_aircraft_id = None
+        elif self.lock_elapsed >= self.lock_duration and eligible:
             self.lock_elapsed = self.lock_duration
+            if self.state != LockState.GREEN_READY:
+                self.completion_flash_remaining = LOCK_FLASH_HALF_PERIOD_SECONDS
             self.state = LockState.GREEN_READY
         else:
             self.state = LockState.RED_TRACKING
@@ -103,9 +174,14 @@ class LockOnTracker:
     def reset(self) -> None:
         self.lock_elapsed = 0.0
         self.state = LockState.WHITE
-        self.target_in_zone = False
+        self.target_visible = False
+        self.target_in_frame = False
+        self.target_aircraft_id = None
+        self.completion_flash_remaining = 0.0
 
     def flash_visible(self, half_period: float = LOCK_FLASH_HALF_PERIOD_SECONDS) -> bool:
+        if self.completion_flash_remaining > 0.0:
+            return True
         if self.state != LockState.RED_TRACKING or half_period <= 0:
             return self.state == LockState.RED_TRACKING
         return int(self.lock_elapsed / half_period) % 2 == 0
@@ -318,6 +394,403 @@ def is_inside_lock_zone(
     return screen_distance_from_center(screen_position, viewport_width, viewport_height) <= radius + 1e-6
 
 
+def clamp_ratio(value: float, *, denominator: float = 1.0) -> float:
+    """Clamp a ratio safely, including a zero/negative denominator."""
+
+    denominator = float(denominator)
+    if denominator <= 0.0:
+        return 0.0
+    return _clamp(float(value) / denominator, 0.0, 1.0)
+
+
+def lock_frame_bounds(
+    viewport_width: float,
+    viewport_height: float,
+    frame_size: float = config.AA_LOCK_FRAME_SIZE,
+) -> tuple[float, float, float, float]:
+    """Return inclusive ``left, bottom, right, top`` pixel bounds."""
+
+    width = max(0.0, float(viewport_width))
+    height = max(0.0, float(viewport_height))
+    half_size = min(width, height) * max(0.0, float(frame_size)) * 0.5
+    center = (width * 0.5, height * 0.5)
+    return (
+        center[0] - half_size,
+        center[1] - half_size,
+        center[0] + half_size,
+        center[1] + half_size,
+    )
+
+
+def _position_in_bounds(
+    screen_position: Vector2,
+    bounds: tuple[float, float, float, float],
+) -> bool:
+    left, bottom, right, top = bounds
+    return (
+        left - 1e-6 <= float(screen_position[0]) <= right + 1e-6
+        and bottom - 1e-6 <= float(screen_position[1]) <= top + 1e-6
+    )
+
+
+def is_inside_lock_frame(
+    screen_position: Vector2,
+    viewport_width: float,
+    viewport_height: float,
+    frame_size: float = config.AA_LOCK_FRAME_SIZE,
+) -> bool:
+    return _position_in_bounds(
+        screen_position,
+        lock_frame_bounds(viewport_width, viewport_height, frame_size),
+    )
+
+
+def is_inside_expanded_lock_frame(
+    screen_position: Vector2,
+    viewport_width: float,
+    viewport_height: float,
+    frame_size: float = config.AA_LOCK_FRAME_SIZE,
+    multiplier: float = AA_AIM_ASSIST_ZONE_MULTIPLIER,
+) -> bool:
+    return is_inside_lock_frame(
+        screen_position,
+        viewport_width,
+        viewport_height,
+        max(0.0, float(frame_size)) * max(0.0, float(multiplier)),
+    )
+
+
+def _candidate_id(candidate: object) -> Optional[str]:
+    value = getattr(candidate, "aircraft_id", None)
+    if value is None:
+        value = getattr(candidate, "id", None)
+    return str(value) if value is not None else None
+
+
+def _candidate_in_frame(candidate: object) -> bool:
+    value = getattr(candidate, "in_lock_frame", None)
+    if value is None:
+        value = getattr(candidate, "in_lock_zone", False)
+    return bool(value)
+
+
+def select_lock_target(
+    candidates: Sequence[object],
+    current_target_id: Optional[str] = None,
+    *,
+    lock_progress: float = 0.0,
+) -> Optional[object]:
+    """Choose a visible in-frame candidate while retaining a valid sticky ID."""
+
+    eligible = [
+        candidate
+        for candidate in candidates
+        if bool(getattr(candidate, "visible", False)) and _candidate_in_frame(candidate)
+        and _candidate_id(candidate) is not None
+    ]
+    if current_target_id is not None:
+        sticky = next(
+            (
+                candidate
+                for candidate in candidates
+                if bool(getattr(candidate, "visible", False))
+                if _candidate_id(candidate) == str(current_target_id)
+                and (_candidate_in_frame(candidate) or float(lock_progress) > 0.0)
+            ),
+            None,
+        )
+        if sticky is not None:
+            return sticky
+    return min(
+        eligible,
+        key=lambda candidate: (
+            float(getattr(candidate, "distance_from_center", float("inf"))),
+            _candidate_id(candidate) or "",
+        ),
+        default=None,
+    )
+
+
+def reticle_position_for_progress(
+    frame_center: Vector2,
+    frame_bounds: tuple[float, float, float, float],
+    target_position: Optional[Vector2],
+    progress: float,
+) -> Vector2:
+    """Interpolate the small reticle toward a target clamped inside the frame."""
+
+    if target_position is None:
+        return (float(frame_center[0]), float(frame_center[1]))
+    left, bottom, right, top = frame_bounds
+    target = (
+        _clamp(float(target_position[0]), left, right),
+        _clamp(float(target_position[1]), bottom, top),
+    )
+    amount = _clamp(float(progress), 0.0, 1.0)
+    return (
+        float(frame_center[0]) + (target[0] - float(frame_center[0])) * amount,
+        float(frame_center[1]) + (target[1] - float(frame_center[1])) * amount,
+    )
+
+
+@dataclass(frozen=True)
+class PlayerStatusView:
+    health: int
+    max_health: int
+    health_ratio: float
+    icon_color: tuple[float, float, float]
+    bar_color: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class CityStatusView:
+    city_health: float
+    max_city_health: float
+    health_ratio: float
+    percent: int
+    icon_color: tuple[float, float, float]
+    bar_color: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class WaveDotView:
+    aircraft_id: str
+    aircraft_type: AircraftType
+    phase: AircraftPhase
+    alive: bool
+    terminal: bool
+    color: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class WaveStatusView:
+    wave_number: int
+    aircraft_total: int
+    aircraft_alive: int
+    aircraft_ratio: float
+    aircraft_percent: int
+    dots: tuple[WaveDotView, ...]
+    selected_aircraft_type: Optional[AircraftType]
+    selected_aircraft_id: Optional[str]
+    selected_type_label: str
+    layout_rows: int
+    dots_per_row: int
+    dot_size: float
+    aircraft_type_labels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class WeaponCooldownView:
+    weapon: WeaponKind
+    remaining_seconds: float
+    duration_seconds: float
+    fill_ratio: float
+    ready: bool
+    visible: bool
+    color: tuple[float, float, float]
+
+
+@dataclass(frozen=True)
+class SniperScopeView:
+    enabled: bool
+    fov: float
+    circular_mask: bool
+    crosshair: bool
+    center_dot: bool
+    checkerboard: bool
+
+
+def build_player_status_view(health: int, max_health: int) -> PlayerStatusView:
+    maximum = max(1, int(max_health))
+    current = int(round(_clamp(float(health), 0.0, float(maximum))))
+    return PlayerStatusView(
+        health=current,
+        max_health=maximum,
+        health_ratio=clamp_ratio(current, denominator=maximum),
+        icon_color=config.RED_RGB,
+        bar_color=config.RED_RGB,
+    )
+
+
+def build_city_status_view(city_health: float, max_city_health: float) -> CityStatusView:
+    maximum = max(1.0, float(max_city_health))
+    current = _clamp(float(city_health), 0.0, maximum)
+    return CityStatusView(
+        city_health=current,
+        max_city_health=maximum,
+        health_ratio=clamp_ratio(current, denominator=maximum),
+        percent=int(round(clamp_ratio(current, denominator=maximum) * 100.0)),
+        icon_color=config.BLUE_RGB,
+        bar_color=config.BLUE_RGB,
+    )
+
+
+def build_wave_status_view(
+    runtime: Optional[WaveRuntime],
+    *,
+    active_target_id: Optional[str] = None,
+    viewport_width: float = config.WINDOW_WIDTH,
+) -> WaveStatusView:
+    if runtime is None:
+        return WaveStatusView(
+            wave_number=1,
+            aircraft_total=0,
+            aircraft_alive=0,
+            aircraft_ratio=0.0,
+            aircraft_percent=0,
+            dots=(),
+            selected_aircraft_type=None,
+            selected_aircraft_id=None,
+            selected_type_label="未選定",
+            layout_rows=0,
+            dots_per_row=0,
+            dot_size=config.HUD_WAVE_DOT_SIZE,
+        )
+    dots = tuple(
+        WaveDotView(
+            aircraft_id=aircraft_id,
+            aircraft_type=runtime.aircraft_types[aircraft_id],
+            phase=runtime.aircraft_statuses[aircraft_id],
+            alive=runtime.aircraft_statuses[aircraft_id]
+            in (AircraftPhase.APPROACHING, AircraftPhase.LOCKED),
+            terminal=runtime.aircraft_statuses[aircraft_id]
+            in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED),
+            color=(
+                config.BLUE_RGB
+                if runtime.aircraft_statuses[aircraft_id]
+                in (AircraftPhase.APPROACHING, AircraftPhase.LOCKED)
+                else config.GRAY_RGB
+            ),
+        )
+        for aircraft_id in runtime.aircraft_ids
+    )
+    selected_id = active_target_id or runtime.active_target_id
+    if selected_id not in runtime.aircraft_ids:
+        selected_id = None
+    selected_type = runtime.aircraft_types[selected_id] if selected_id is not None else None
+    type_labels = {
+        AircraftType.NORMAL: "普通",
+        AircraftType.MANPOWER_SUPPORT: "人力支援",
+        AircraftType.FAST: "快速",
+        AircraftType.ARMORED_BOSS: "Boss",
+    }
+    aircraft_type_labels = tuple(
+        dict.fromkeys(type_labels.get(dot.aircraft_type, "未分類") for dot in dots)
+    )
+    total = len(dots)
+    width_capacity = max(1, int(float(viewport_width) / 64.0))
+    dots_per_row = max(
+        1,
+        min(config.HUD_WAVE_DOTS_PER_ROW, width_capacity),
+    )
+    rows = ceil(total / dots_per_row) if total else 0
+    dot_size = (
+        config.HUD_WAVE_DOT_MIN_SIZE
+        if total > config.HUD_WAVE_DOTS_PER_ROW
+        else config.HUD_WAVE_DOT_SIZE
+    )
+    return WaveStatusView(
+        wave_number=runtime.wave.wave_number,
+        aircraft_total=total,
+        aircraft_alive=runtime.remaining_aircraft_count,
+        aircraft_ratio=runtime.alive_ratio,
+        aircraft_percent=int(round(runtime.alive_ratio * 100.0)),
+        dots=dots,
+        selected_aircraft_type=selected_type,
+        selected_aircraft_id=selected_id,
+        selected_type_label=type_labels.get(selected_type, "未選定"),
+        layout_rows=rows,
+        dots_per_row=dots_per_row,
+        dot_size=dot_size,
+        aircraft_type_labels=aircraft_type_labels,
+    )
+
+
+def _weapon_lookup(weapons: Mapping[object, object]) -> dict[WeaponKind, object]:
+    result: dict[WeaponKind, object] = {}
+    aliases = {
+        "aa": WeaponKind.ANTI_AIRCRAFT,
+        "anti_aircraft": WeaponKind.ANTI_AIRCRAFT,
+        "sniper": WeaponKind.SNIPER,
+        "pistol": WeaponKind.PISTOL,
+    }
+    for key, value in weapons.items():
+        kind = key if isinstance(key, WeaponKind) else aliases.get(str(key))
+        if kind is not None:
+            result[kind] = value
+    return result
+
+
+def weapon_cooldown_view(
+    weapon: Optional[WeaponKind | str],
+    weapons: Mapping[object, object],
+    *,
+    gameplay: bool = True,
+) -> Optional[WeaponCooldownView]:
+    if weapon is None or not gameplay:
+        return None
+    aliases = {
+        "aa": WeaponKind.ANTI_AIRCRAFT,
+        "anti_aircraft": WeaponKind.ANTI_AIRCRAFT,
+        "sniper": WeaponKind.SNIPER,
+        "pistol": WeaponKind.PISTOL,
+    }
+    kind = weapon if isinstance(weapon, WeaponKind) else aliases.get(str(weapon))
+    if kind is None:
+        return None
+    source = _weapon_lookup(weapons).get(kind)
+    if source is None:
+        return None
+    durations = {
+        WeaponKind.ANTI_AIRCRAFT: config.AA_FIRE_COOLDOWN_SECONDS,
+        WeaponKind.SNIPER: config.SNIPER_FIRE_COOLDOWN_SECONDS,
+        WeaponKind.PISTOL: config.PISTOL_FIRE_COOLDOWN_SECONDS,
+    }
+    duration = max(1e-6, float(durations[kind]))
+    remaining = min(
+        duration,
+        max(0.0, float(getattr(source, "fire_cooldown", 0.0))),
+    )
+    ratio = clamp_ratio(duration - min(duration, remaining), denominator=duration)
+    return WeaponCooldownView(
+        weapon=kind,
+        remaining_seconds=remaining,
+        duration_seconds=duration,
+        fill_ratio=ratio,
+        ready=remaining <= 0.0,
+        visible=True,
+        color=config.GREEN_RGB if remaining <= 0.0 else config.YELLOW_RGB,
+    )
+
+
+def reset_weapon_cooldowns(*weapon_objects: object) -> int:
+    """Reset each weapon object once and return the number changed."""
+
+    if len(weapon_objects) == 1 and isinstance(weapon_objects[0], Mapping):
+        weapon_objects = tuple(weapon_objects[0].values())
+    changed = 0
+    seen: set[int] = set()
+    for weapon in weapon_objects:
+        if weapon is None or id(weapon) in seen or not hasattr(weapon, "fire_cooldown"):
+            continue
+        seen.add(id(weapon))
+        if float(getattr(weapon, "fire_cooldown", 0.0)) != 0.0:
+            changed += 1
+        setattr(weapon, "fire_cooldown", 0.0)
+    return changed
+
+
+def sniper_scope_view(enabled: bool) -> SniperScopeView:
+    return SniperScopeView(
+        enabled=bool(enabled),
+        fov=config.CAMERA_SCOPE_FOV,
+        circular_mask=True,
+        crosshair=True,
+        center_dot=True,
+        checkerboard=False,
+    )
+
+
 def raycast_hit_matches_target(hit_result: object, target: object) -> bool:
     """Resolve an engine raycast wrapper and match its entity parent chain."""
 
@@ -368,6 +841,7 @@ def apply_aim_assist(
     delta_seconds: float,
     activation_multiplier: float = AA_AIM_ASSIST_ZONE_MULTIPLIER,
     maximum_degrees_per_second: float = AA_AIM_ASSIST_MAX_DEGREES_PER_SECOND,
+    target_in_expanded_frame: Optional[bool] = None,
 ) -> Vector3:
     """Apply small scope-only attraction after player mouse rotation."""
 
@@ -375,7 +849,12 @@ def apply_aim_assist(
     if not scope_enabled or not target_visible:
         return current
     activation_radius = max(0.0, float(lock_zone_radius_pixels)) * max(0.0, float(activation_multiplier))
-    if float(target_screen_distance) > activation_radius + 1e-6:
+    in_activation_zone = (
+        bool(target_in_expanded_frame)
+        if target_in_expanded_frame is not None
+        else float(target_screen_distance) <= activation_radius + 1e-6
+    )
+    if not in_activation_zone:
         return current
     maximum_degrees = max(0.0, float(maximum_degrees_per_second)) * max(0.0, float(delta_seconds))
     return rotate_direction_towards(current, target_direction, maximum_degrees)
@@ -464,12 +943,22 @@ def can_fire_anti_air(
     cooldown_remaining: float,
     held_weapon: Optional[WeaponKind] = WeaponKind.ANTI_AIRCRAFT,
     target_in_zone: bool = False,
+    *,
+    target_aircraft_id: Optional[str] = None,
+    target_visible: Optional[bool] = None,
+    target_in_frame: Optional[bool] = None,
+    scope_enabled: Optional[bool] = None,
 ) -> bool:
+    in_frame = bool(target_in_zone if target_in_frame is None else target_in_frame)
+    visible = bool(in_frame if target_visible is None else target_visible)
     return (
         held_weapon == WeaponKind.ANTI_AIRCRAFT
         and lock_state == LockState.GREEN_READY
         and cooldown_ready(cooldown_remaining)
-        and bool(target_in_zone)
+        and in_frame
+        and visible
+        and (scope_enabled is not False)
+        and (target_aircraft_id is None or bool(target_aircraft_id))
     )
 
 
@@ -478,7 +967,9 @@ def apply_guided_missile_damage(
     missile: object,
     step: object,
     *,
-    active_aircraft_id: Optional[str],
+    active_aircraft_id: Optional[str] = None,
+    expected_aircraft_id: Optional[str] = None,
+    target_id: Optional[str] = None,
     damage: int = 1,
 ) -> bool:
     """Apply one collision-time hit after validating target identity and phase."""
@@ -488,8 +979,17 @@ def apply_guided_missile_damage(
     if bool(getattr(missile, "damage_applied", False)):
         return False
     aircraft_id = getattr(aircraft, "id", None)
-    target_id = getattr(missile, "target_aircraft_id", None)
-    if active_aircraft_id is None or aircraft_id != active_aircraft_id or target_id != active_aircraft_id:
+    missile_target_id = getattr(missile, "target_aircraft_id", None)
+    expected_target_id = (
+        expected_aircraft_id
+        if expected_aircraft_id is not None
+        else target_id if target_id is not None else active_aircraft_id
+    )
+    if (
+        expected_target_id is None
+        or aircraft_id != expected_target_id
+        or missile_target_id != expected_target_id
+    ):
         return False
     if getattr(aircraft, "phase", None) in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED):
         return False
@@ -691,7 +1191,7 @@ class WaveDirector:
 
 
 class EncounterFactory:
-    """Creates one deterministic, finite crew group for one aircraft."""
+    """Creates deterministic finite crew groups for aircraft or a full wave."""
 
     def __init__(
         self,
@@ -716,20 +1216,97 @@ class EncounterFactory:
                 random_source = aircraft_type  # type: ignore[assignment]
             aircraft_type = AircraftType.NORMAL
         source = random_source if random_source is not None else random
+        encounter_id = f"encounter:{aircraft_id}"
+        count = self._crew_count(aircraft_type, source)
+        members = self._create_source_crew(
+            aircraft_id,
+            aircraft_type,
+            count,
+            encounter_id,
+        )
+        return GroundEncounter(
+            aircraft_id=aircraft_id,
+            crew=members,
+            crew_count=count,
+            aircraft_type=aircraft_type,
+            boss_id=members[0].id if aircraft_type == AircraftType.ARMORED_BOSS and members else None,
+            source_aircraft_ids=(aircraft_id,),
+        )
+
+    def create_for_wave(
+        self,
+        wave_number: int,
+        aircraft_ids: Sequence[str],
+        aircraft_types: Mapping[str, AircraftType],
+        random_source: Optional[RandomSource] = None,
+    ) -> GroundEncounter:
+        """Merge all source aircraft into one ``encounter:wave-N`` group."""
+
+        from .entities import GroundEncounter
+
+        ids = tuple(str(aircraft_id) for aircraft_id in aircraft_ids)
+        if not ids or len(set(ids)) != len(ids):
+            raise ValueError("aircraft_ids must be a non-empty unique sequence")
+        if set(aircraft_types) != set(ids):
+            raise ValueError("aircraft_types keys must match aircraft_ids")
+        wave_number = max(1, int(wave_number))
+        source = random_source if random_source is not None else random
+        group_id = f"wave-{wave_number}"
+        encounter_id = f"encounter:{group_id}"
+        members = []
+        for aircraft_id in ids:
+            aircraft_type = AircraftType(aircraft_types[aircraft_id])
+            # NORMAL consumes exactly one random draw per source. Fixed-size
+            # types never call randint, which makes wave fixtures reproducible.
+            count = self._crew_count(aircraft_type, source)
+            members.extend(
+                self._create_source_crew(
+                    aircraft_id,
+                    aircraft_type,
+                    count,
+                    encounter_id,
+                )
+            )
+        boss = next((member for member in members if member.is_boss), None)
+        aggregate_type = (
+            AircraftType.ARMORED_BOSS
+            if boss is not None
+            else AircraftType.NORMAL
+        )
+        return GroundEncounter(
+            aircraft_id=group_id,
+            crew=members,
+            crew_count=len(members),
+            aircraft_type=aggregate_type,
+            boss_id=boss.id if boss is not None else None,
+            source_aircraft_ids=ids,
+            group_id=group_id,
+        )
+
+    def _crew_count(self, aircraft_type: AircraftType, source: RandomSource) -> int:
+        aircraft_type = AircraftType(aircraft_type)
         if aircraft_type == AircraftType.NORMAL:
-            minimum = max(0, min(ENCOUNTER_MAX_CREW, self.minimum))
-            maximum = max(minimum, min(ENCOUNTER_MAX_CREW, self.maximum))
-            count = source.randint(minimum, maximum)
-        elif aircraft_type == AircraftType.MANPOWER_SUPPORT:
-            count = config.MANPOWER_SUPPORT_CREW
-        elif aircraft_type == AircraftType.FAST:
-            count = 0
-        else:
-            count = 1
+            minimum = max(0, min(ENCOUNTER_MAX_CREW, int(self.minimum)))
+            maximum = max(minimum, min(ENCOUNTER_MAX_CREW, int(self.maximum)))
+            return int(source.randint(minimum, maximum))
+        if aircraft_type == AircraftType.MANPOWER_SUPPORT:
+            return config.MANPOWER_SUPPORT_CREW
+        if aircraft_type == AircraftType.FAST:
+            return 0
+        return 1
+
+    @staticmethod
+    def _create_source_crew(
+        aircraft_id: str,
+        aircraft_type: AircraftType,
+        count: int,
+        encounter_id: str,
+    ) -> list[object]:
+        from .entities import CrewMember
 
         route_nodes = config.COVER_NODES
-        members = []
-        for index in range(count):
+        members: list[CrewMember] = []
+        for index in range(max(0, int(count))):
             current_node = route_nodes[index % len(route_nodes)]
             target_node = (
                 route_nodes[(index + 1) % len(route_nodes)]
@@ -745,7 +1322,7 @@ class EncounterFactory:
             members.append(
                 CrewMember(
                     id=f"{aircraft_id}-crew-{index + 1}",
-                    encounter_id=f"encounter:{aircraft_id}",
+                    encounter_id=encounter_id,
                     cover_node=current_node,
                     squad_role=role,
                     behavior_state=CrewBehaviorState.IN_COVER,
@@ -762,13 +1339,7 @@ class EncounterFactory:
                     is_boss=is_boss,
                 )
             )
-        return GroundEncounter(
-            aircraft_id=aircraft_id,
-            crew=members,
-            crew_count=count,
-            aircraft_type=aircraft_type,
-            boss_id=members[0].id if aircraft_type == AircraftType.ARMORED_BOSS and members else None,
-        )
+        return members
 
 
 def advance_crew_behavior(

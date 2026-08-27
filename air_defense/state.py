@@ -138,6 +138,127 @@ class WavePlan:
 
 
 @dataclass
+class WaveRuntime:
+    """Authoritative per-aircraft state for one simultaneous wave.
+
+    ``Aircraft`` owns movement and health transitions.  This ledger is the
+    controller-owned, ordered snapshot used by HUD aggregation and wave
+    transitions, so a single destroyed aircraft cannot accidentally advance
+    the whole wave.
+    """
+
+    wave: WaveProgress
+    aircraft_ids: tuple[str, ...]
+    aircraft_statuses: dict[str, AircraftPhase] = field(default_factory=dict)
+    aircraft_types: dict[str, AircraftType] = field(default_factory=dict)
+    active_target_id: Optional[str] = None
+    ground_encounter_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.aircraft_ids = tuple(str(aircraft_id) for aircraft_id in self.aircraft_ids)
+        if not self.aircraft_ids:
+            raise ValueError("aircraft_ids must not be empty")
+        if len(set(self.aircraft_ids)) != len(self.aircraft_ids):
+            raise ValueError("aircraft_ids must be unique")
+        if len(self.aircraft_ids) != self.wave.aircraft_count:
+            raise ValueError("aircraft_ids length must match wave aircraft_count")
+
+        default_types = dict(zip(self.aircraft_ids, self.wave.roster))
+        if not self.aircraft_types:
+            self.aircraft_types = default_types
+        else:
+            self.aircraft_types = {
+                str(aircraft_id): AircraftType(aircraft_type)
+                for aircraft_id, aircraft_type in self.aircraft_types.items()
+            }
+        if set(self.aircraft_types) != set(self.aircraft_ids):
+            raise ValueError("aircraft_types keys must match aircraft_ids")
+
+        if not self.aircraft_statuses:
+            self.aircraft_statuses = {
+                aircraft_id: AircraftPhase.APPROACHING
+                for aircraft_id in self.aircraft_ids
+            }
+        else:
+            self.aircraft_statuses = {
+                str(aircraft_id): AircraftPhase(phase)
+                for aircraft_id, phase in self.aircraft_statuses.items()
+            }
+        if set(self.aircraft_statuses) != set(self.aircraft_ids):
+            raise ValueError("aircraft_statuses keys must match aircraft_ids")
+        if self.active_target_id is not None and self.active_target_id not in self.aircraft_ids:
+            raise ValueError("active_target_id must belong to aircraft_ids")
+
+    @property
+    def alive_aircraft_ids(self) -> tuple[str, ...]:
+        return tuple(
+            aircraft_id
+            for aircraft_id in self.aircraft_ids
+            if self.aircraft_statuses[aircraft_id]
+            in (AircraftPhase.APPROACHING, AircraftPhase.LOCKED)
+        )
+
+    @property
+    def remaining_aircraft_count(self) -> int:
+        return len(self.alive_aircraft_ids)
+
+    @property
+    def alive_ratio(self) -> float:
+        return self.remaining_aircraft_count / float(len(self.aircraft_ids))
+
+    @property
+    def all_aircraft_destroyed(self) -> bool:
+        return bool(self.aircraft_ids) and all(
+            self.aircraft_statuses[aircraft_id] == AircraftPhase.DESTROYED
+            for aircraft_id in self.aircraft_ids
+        )
+
+    def sync_aircraft_phase(
+        self,
+        aircraft_id: str,
+        phase: AircraftPhase,
+    ) -> bool:
+        """Mirror one entity transition, rejecting stale or regressive IDs."""
+
+        aircraft_id = str(aircraft_id)
+        if aircraft_id not in self.aircraft_statuses:
+            return False
+        phase = AircraftPhase(phase)
+        current = self.aircraft_statuses[aircraft_id]
+        if current in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED):
+            return False
+        if phase == AircraftPhase.APPROACHING and current == AircraftPhase.LOCKED:
+            return False
+        if phase not in (
+            AircraftPhase.APPROACHING,
+            AircraftPhase.LOCKED,
+            AircraftPhase.DESTROYED,
+            AircraftPhase.IMPACTED,
+        ):
+            return False
+        if current == phase:
+            return False
+        self.aircraft_statuses[aircraft_id] = phase
+        if self.active_target_id == aircraft_id and phase in (
+            AircraftPhase.DESTROYED,
+            AircraftPhase.IMPACTED,
+        ):
+            self.active_target_id = None
+        return True
+
+    def mark_destroyed(self, aircraft_id: str) -> bool:
+        return self.sync_aircraft_phase(aircraft_id, AircraftPhase.DESTROYED)
+
+    def mark_impacted(self, aircraft_id: str) -> bool:
+        return self.sync_aircraft_phase(aircraft_id, AircraftPhase.IMPACTED)
+
+    def set_active_target(self, aircraft_id: Optional[str]) -> None:
+        if aircraft_id is not None and aircraft_id not in self.aircraft_ids:
+            raise ValueError("active target must belong to this wave")
+        self.active_target_id = aircraft_id
+
+
+@dataclass
 class SessionStats:
     """Counters whose updates are protected from repeated engine callbacks."""
 
@@ -203,6 +324,7 @@ class GameSession:
     city_health: float = CITY_MAX_HEALTH
     max_city_health: float = CITY_MAX_HEALTH
     stats: SessionStats = field(default_factory=SessionStats)
+    wave_runtime: Optional[WaveRuntime] = None
     _processed_events: set[str] = field(default_factory=set, repr=False)
 
     def start_new_game(self, wave_plan: Optional["WavePlan"] = None) -> GamePhase:
@@ -213,12 +335,88 @@ class GameSession:
         self.active_encounter_id = None
         self.city_health = self.max_city_health
         self.wave = wave_plan.to_progress() if wave_plan is not None else WaveProgress()
+        self.wave_runtime = None
         self.aircraft_sequence = 1
         self.active_aircraft_id = self._aircraft_id(self.aircraft_sequence)
         self.active_aircraft_type = self.wave.active_aircraft_type
         self.stats.reset()
         self._processed_events.clear()
         return self.phase
+
+    def initialize_wave_runtime(
+        self,
+        aircraft_ids: tuple[str, ...],
+        aircraft_types: Optional[dict[str, AircraftType]] = None,
+    ) -> WaveRuntime:
+        """Create the authoritative simultaneous-wave ledger.
+
+        This is deliberately separate from ``start_new_game`` so legacy
+        callers that use the scalar transition API keep their old behavior.
+        The graphical controller opts into the keyed runtime immediately
+        after it has generated deterministic IDs for the roster.
+        """
+
+        self.wave_runtime = WaveRuntime(
+            wave=self.wave,
+            aircraft_ids=aircraft_ids,
+            aircraft_types=aircraft_types or dict(
+                zip(aircraft_ids, self.wave.roster)
+            ),
+        )
+        self.active_aircraft_id = aircraft_ids[0]
+        self.active_aircraft_type = self.wave_runtime.aircraft_types[aircraft_ids[0]]
+        return self.wave_runtime
+
+    def sync_aircraft_phase(self, aircraft_id: str, phase: AircraftPhase) -> bool:
+        if self.wave_runtime is None:
+            return False
+        changed = self.wave_runtime.sync_aircraft_phase(aircraft_id, phase)
+        if self.wave_runtime.active_target_id is None:
+            self.active_aircraft_id = (
+                self.active_aircraft_id
+                if self.active_aircraft_id in self.wave_runtime.alive_aircraft_ids
+                else (self.wave_runtime.alive_aircraft_ids[0]
+                      if self.wave_runtime.alive_aircraft_ids else None)
+            )
+        return changed
+
+    def mark_aircraft_destroyed(self, aircraft_id: str) -> bool:
+        if self.wave_runtime is None:
+            return False
+        changed = self.wave_runtime.mark_destroyed(aircraft_id)
+        if changed:
+            key = f"aircraft-destroyed:{aircraft_id}"
+            self.stats.record_once(key, "aircraft_destroyed")
+            self.active_aircraft_id = (
+                self.wave_runtime.alive_aircraft_ids[0]
+                if self.wave_runtime.alive_aircraft_ids
+                else None
+            )
+            self.active_aircraft_type = (
+                self.wave_runtime.aircraft_types[self.active_aircraft_id]
+                if self.active_aircraft_id is not None
+                else None
+            )
+        return changed
+
+    def mark_aircraft_impacted(self, aircraft_id: str) -> bool:
+        if self.wave_runtime is None:
+            return False
+        changed = self.wave_runtime.mark_impacted(aircraft_id)
+        if changed and self.active_aircraft_id == aircraft_id:
+            self.active_aircraft_id = None
+            self.active_aircraft_type = None
+        return changed
+
+    def set_active_target(self, aircraft_id: Optional[str]) -> None:
+        if self.wave_runtime is not None:
+            self.wave_runtime.set_active_target(aircraft_id)
+        self.active_aircraft_id = aircraft_id
+        self.active_aircraft_type = (
+            self.wave_runtime.aircraft_types[aircraft_id]
+            if self.wave_runtime is not None and aircraft_id is not None
+            else None
+        )
 
     def transition(
         self,
@@ -246,6 +444,34 @@ class GameSession:
         if event == SessionEvent.AIRCRAFT_DESTROYED:
             if self.phase != GamePhase.AIRSTRIKE:
                 return self.phase
+            if self.wave_runtime is not None:
+                target_id = aircraft_id or self.wave_runtime.active_target_id or self.active_aircraft_id
+                if target_id is None or target_id not in self.wave_runtime.aircraft_ids:
+                    return self.phase
+                key = event_id or f"aircraft-destroyed:{target_id}"
+                if key in self._processed_events:
+                    return self.phase
+                if not self.wave_runtime.mark_destroyed(target_id):
+                    return self.phase
+                self._processed_events.add(key)
+                self.stats.record_once(key, "aircraft_destroyed")
+                self.wave_runtime.set_active_target(None)
+                if self.wave_runtime.all_aircraft_destroyed:
+                    self.active_encounter_id = (
+                        self.wave_runtime.ground_encounter_id
+                        or f"encounter:wave-{self.wave.wave_number}"
+                    )
+                    self.wave_runtime.ground_encounter_id = self.active_encounter_id
+                    self.active_aircraft_id = None
+                    self.active_aircraft_type = None
+                    self.reset_airstrike_guidance()
+                    self.phase = GamePhase.GROUND_COMBAT
+                else:
+                    self.active_aircraft_id = self.wave_runtime.alive_aircraft_ids[0]
+                    self.active_aircraft_type = self.wave_runtime.aircraft_types[
+                        self.active_aircraft_id
+                    ]
+                return self.phase
             if aircraft_id is not None and aircraft_id != self.active_aircraft_id:
                 return self.phase
             target_id = aircraft_id or self.active_aircraft_id or "unknown-aircraft"
@@ -262,6 +488,20 @@ class GameSession:
         if event == SessionEvent.BUILDING_IMPACT:
             if self.phase != GamePhase.AIRSTRIKE:
                 return self.phase
+            if self.wave_runtime is not None:
+                target_id = aircraft_id or self.active_aircraft_id
+                if target_id is None or target_id not in self.wave_runtime.aircraft_ids:
+                    return self.phase
+                key = event_id or f"building-impact:{target_id}"
+                if key in self._processed_events:
+                    return self.phase
+                if not self.wave_runtime.mark_impacted(target_id):
+                    return self.phase
+                self._processed_events.add(key)
+                self.stats.record_once(key, "building_impact")
+                self.reset_airstrike_guidance()
+                self.phase = GamePhase.GAME_OVER
+                return self.phase
             if aircraft_id is not None and aircraft_id != self.active_aircraft_id:
                 return self.phase
             key = event_id or f"building-impact:{self.active_aircraft_id or 'unknown-aircraft'}"
@@ -275,6 +515,48 @@ class GameSession:
 
         if event == SessionEvent.CREW_CLEARED:
             if self.phase != GamePhase.GROUND_COMBAT:
+                return self.phase
+            if self.wave_runtime is not None:
+                current_id = encounter_id or self.active_encounter_id
+                if (
+                    current_id is None
+                    or self.wave_runtime.ground_encounter_id not in (None, current_id)
+                ):
+                    return self.phase
+                key = event_id or f"crew-cleared:{current_id}"
+                if key in self._processed_events:
+                    return self.phase
+                self._processed_events.add(key)
+                next_wave = (
+                    wave_plan.to_progress()
+                    if wave_plan is not None
+                    else WaveProgress(
+                        wave_number=self.wave.wave_number + 1,
+                        aircraft_count=self.wave.aircraft_count + 1,
+                        aircraft_cap=(
+                            self.wave.aircraft_cap + 2
+                            if self.wave.aircraft_count >= self.wave.aircraft_cap
+                            else self.wave.aircraft_cap
+                        ),
+                        is_boss_wave=(self.wave.wave_number + 1) % 10 == 0,
+                        roster=tuple(
+                            AircraftType.NORMAL
+                            for _ in range(self.wave.aircraft_count + 1)
+                        ),
+                    )
+                )
+                self.wave = next_wave
+                self.wave_runtime = None
+                self.active_encounter_id = None
+                self.aircraft_sequence += 1
+                base_id = self._aircraft_id(self.aircraft_sequence)
+                ids = tuple(
+                    base_id if index == 0 else f"{base_id}-{index + 1:02d}"
+                    for index in range(next_wave.aircraft_count)
+                )
+                self.initialize_wave_runtime(ids, dict(zip(ids, next_wave.roster)))
+                self.reset_airstrike_guidance()
+                self.phase = GamePhase.AIRSTRIKE
                 return self.phase
             if encounter_id is not None and encounter_id != self.active_encounter_id:
                 return self.phase
@@ -368,6 +650,8 @@ class GameSession:
             self.lock_state = LockState.WHITE
             self.lock_elapsed = 0.0
             self.target_in_zone = False
+            if self.wave_runtime is not None:
+                self.wave_runtime.set_active_target(None)
 
     def reset_airstrike_guidance(self, *, clear_missiles: bool = True) -> None:
         """Clear transient lock/target/missile state at an airstrike boundary."""
@@ -376,6 +660,8 @@ class GameSession:
         self.target_in_zone = False
         self.lock_state = LockState.WHITE
         self.lock_elapsed = 0.0
+        if self.wave_runtime is not None:
+            self.wave_runtime.set_active_target(None)
         if clear_missiles:
             self.active_missile_ids.clear()
 
@@ -388,6 +674,7 @@ class GameSession:
         self.active_encounter_id = None
         self.aircraft_sequence = 0
         self.wave = WaveProgress()
+        self.wave_runtime = None
         self.active_aircraft_type = None
         self.city_health = self.max_city_health
         self.stats.reset()
