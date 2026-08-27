@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
-from .config import PLAYER_MAX_HEALTH
+from .config import CITY_MAX_HEALTH, PLAYER_MAX_HEALTH
 
 
 class GamePhase(str, Enum):
@@ -25,11 +25,20 @@ class LockState(str, Enum):
 class FailureReason(str, Enum):
     BUILDING_IMPACT = "BUILDING_IMPACT"
     PLAYER_DEAD = "PLAYER_DEAD"
+    CITY_DESTROYED = "CITY_DESTROYED"
 
 
 class WeaponKind(str, Enum):
     ANTI_AIRCRAFT = "ANTI_AIRCRAFT"
     SNIPER = "SNIPER"
+    PISTOL = "PISTOL"
+
+
+class AircraftType(str, Enum):
+    NORMAL = "NORMAL"
+    MANPOWER_SUPPORT = "MANPOWER_SUPPORT"
+    FAST = "FAST"
+    ARMORED_BOSS = "ARMORED_BOSS"
 
 
 class AircraftPhase(str, Enum):
@@ -56,7 +65,76 @@ class SessionEvent(str, Enum):
     BUILDING_IMPACT = "BUILDING_IMPACT"
     CREW_CLEARED = "CREW_CLEARED"
     PLAYER_DIED = "PLAYER_DIED"
+    CITY_DESTROYED = "CITY_DESTROYED"
     RETURN_TO_MENU = "RETURN_TO_MENU"
+
+
+@dataclass
+class WaveProgress:
+    """Mutable progress for one roster; the director owns roster creation."""
+
+    wave_number: int = 1
+    aircraft_index: int = 0
+    aircraft_count: int = 2
+    aircraft_cap: int = 6
+    is_boss_wave: bool = False
+    roster: tuple[AircraftType, ...] = field(default_factory=tuple)
+
+    def __post_init__(self) -> None:
+        self.wave_number = max(1, int(self.wave_number))
+        self.aircraft_cap = max(1, int(self.aircraft_cap))
+        requested_count = max(1, int(self.aircraft_count))
+        if not self.roster:
+            self.roster = tuple(AircraftType.NORMAL for _ in range(requested_count))
+        self.roster = tuple(AircraftType(item) for item in self.roster)
+        self.aircraft_count = len(self.roster)
+        self.aircraft_index = max(0, min(int(self.aircraft_index), self.aircraft_count - 1))
+        self.is_boss_wave = bool(self.is_boss_wave)
+
+    @property
+    def active_aircraft_type(self) -> AircraftType:
+        return self.roster[self.aircraft_index]
+
+    @property
+    def is_last_aircraft(self) -> bool:
+        return self.aircraft_index >= self.aircraft_count - 1
+
+    def advance_aircraft(self) -> bool:
+        """Move to the next roster slot and report whether one exists."""
+
+        if self.is_last_aircraft:
+            return False
+        self.aircraft_index += 1
+        return True
+
+
+@dataclass(frozen=True)
+class WavePlan:
+    """Immutable roster returned by the deterministic wave director."""
+
+    wave_number: int
+    aircraft_count: int
+    aircraft_cap: int
+    is_boss_wave: bool
+    roster: tuple[AircraftType, ...]
+
+    def __post_init__(self) -> None:
+        if self.wave_number < 1:
+            raise ValueError("wave_number must be positive")
+        if self.aircraft_count < 1:
+            raise ValueError("aircraft_count must be positive")
+        if len(self.roster) != self.aircraft_count:
+            raise ValueError("roster length must match aircraft_count")
+
+    def to_progress(self) -> WaveProgress:
+        return WaveProgress(
+            wave_number=self.wave_number,
+            aircraft_index=0,
+            aircraft_count=self.aircraft_count,
+            aircraft_cap=self.aircraft_cap,
+            is_boss_wave=self.is_boss_wave,
+            roster=self.roster,
+        )
 
 
 @dataclass
@@ -81,6 +159,8 @@ class SessionStats:
             self.failure_reason = FailureReason.BUILDING_IMPACT
         elif event_type == "player_dead":
             self.failure_reason = FailureReason.PLAYER_DEAD
+        elif event_type == "city_destroyed":
+            self.failure_reason = FailureReason.CITY_DESTROYED
         return True
 
     def tick(self, delta_seconds: float) -> None:
@@ -115,18 +195,25 @@ class GameSession:
     active_aircraft_id: Optional[str] = None
     active_encounter_id: Optional[str] = None
     aircraft_sequence: int = 0
+    wave: WaveProgress = field(default_factory=WaveProgress)
+    active_aircraft_type: Optional[AircraftType] = None
+    city_health: float = CITY_MAX_HEALTH
+    max_city_health: float = CITY_MAX_HEALTH
     stats: SessionStats = field(default_factory=SessionStats)
     _processed_events: set[str] = field(default_factory=set, repr=False)
 
-    def start_new_game(self) -> GamePhase:
+    def start_new_game(self, wave_plan: Optional["WavePlan"] = None) -> GamePhase:
         self.phase = GamePhase.AIRSTRIKE
         self.health = self.max_health
         self.held_weapon = None
         self.lock_state = LockState.WHITE
         self.lock_elapsed = 0.0
         self.active_encounter_id = None
+        self.city_health = self.max_city_health
+        self.wave = wave_plan.to_progress() if wave_plan is not None else WaveProgress()
         self.aircraft_sequence = 1
         self.active_aircraft_id = self._aircraft_id(self.aircraft_sequence)
+        self.active_aircraft_type = self.wave.active_aircraft_type
         self.stats.reset()
         self._processed_events.clear()
         return self.phase
@@ -138,11 +225,12 @@ class GameSession:
         event_id: Optional[str] = None,
         aircraft_id: Optional[str] = None,
         encounter_id: Optional[str] = None,
+        wave_plan: Optional["WavePlan"] = None,
     ) -> GamePhase:
         event = SessionEvent(event)
         if event == SessionEvent.START_GAME:
             if self.phase == GamePhase.MAIN_MENU:
-                return self.start_new_game()
+                return self.start_new_game(wave_plan)
             return self.phase
 
         if event == SessionEvent.RETURN_TO_MENU:
@@ -156,11 +244,7 @@ class GameSession:
         if event == SessionEvent.AIRCRAFT_DESTROYED:
             if self.phase != GamePhase.AIRSTRIKE:
                 return self.phase
-            if (
-                aircraft_id is not None
-                and self.active_aircraft_id is not None
-                and aircraft_id != self.active_aircraft_id
-            ):
+            if aircraft_id is not None and aircraft_id != self.active_aircraft_id:
                 return self.phase
             target_id = aircraft_id or self.active_aircraft_id or "unknown-aircraft"
             key = event_id or f"aircraft-destroyed:{target_id}"
@@ -177,11 +261,7 @@ class GameSession:
         if event == SessionEvent.BUILDING_IMPACT:
             if self.phase != GamePhase.AIRSTRIKE:
                 return self.phase
-            if (
-                aircraft_id is not None
-                and self.active_aircraft_id is not None
-                and aircraft_id != self.active_aircraft_id
-            ):
+            if aircraft_id is not None and aircraft_id != self.active_aircraft_id:
                 return self.phase
             key = event_id or f"building-impact:{self.active_aircraft_id or 'unknown-aircraft'}"
             if key in self._processed_events:
@@ -194,11 +274,7 @@ class GameSession:
         if event == SessionEvent.CREW_CLEARED:
             if self.phase != GamePhase.GROUND_COMBAT:
                 return self.phase
-            if (
-                encounter_id is not None
-                and self.active_encounter_id is not None
-                and encounter_id != self.active_encounter_id
-            ):
+            if encounter_id is not None and encounter_id != self.active_encounter_id:
                 return self.phase
             current_id = encounter_id or self.active_encounter_id or "unknown-encounter"
             key = event_id or f"crew-cleared:{current_id}"
@@ -206,8 +282,23 @@ class GameSession:
                 return self.phase
             self._processed_events.add(key)
             self.active_encounter_id = None
+            if self.wave.advance_aircraft():
+                pass
+            elif wave_plan is not None:
+                self.wave = wave_plan.to_progress()
+            else:
+                next_count = self.wave.aircraft_count + 1
+                next_cap = self.wave.aircraft_cap + 2 if self.wave.aircraft_count >= self.wave.aircraft_cap else self.wave.aircraft_cap
+                self.wave = WaveProgress(
+                    wave_number=self.wave.wave_number + 1,
+                    aircraft_count=next_count,
+                    aircraft_cap=next_cap,
+                    is_boss_wave=(self.wave.wave_number + 1) % 10 == 0,
+                    roster=tuple(AircraftType.NORMAL for _ in range(next_count)),
+                )
             self.aircraft_sequence += 1
             self.active_aircraft_id = self._aircraft_id(self.aircraft_sequence)
+            self.active_aircraft_type = self.wave.active_aircraft_type
             self.phase = GamePhase.AIRSTRIKE
             return self.phase
 
@@ -223,6 +314,18 @@ class GameSession:
             self.phase = GamePhase.GAME_OVER
             return self.phase
 
+        if event == SessionEvent.CITY_DESTROYED:
+            if self.phase != GamePhase.GROUND_COMBAT:
+                return self.phase
+            key = event_id or "city-destroyed"
+            if key in self._processed_events:
+                return self.phase
+            self._processed_events.add(key)
+            self.city_health = 0.0
+            self.stats.record_once(key, "city_destroyed")
+            self.phase = GamePhase.GAME_OVER
+            return self.phase
+
         return self.phase
 
     def take_damage(self, amount: int) -> bool:
@@ -231,6 +334,17 @@ class GameSession:
         self.health = max(0, self.health - max(0, amount))
         if self.health == 0:
             self.transition(SessionEvent.PLAYER_DIED)
+            return True
+        return False
+
+    def take_city_damage(self, amount: float) -> bool:
+        """Apply city damage and transition once when its health reaches zero."""
+
+        if self.phase != GamePhase.GROUND_COMBAT or amount <= 0:
+            return False
+        self.city_health = max(0.0, self.city_health - amount)
+        if self.city_health <= 0.0:
+            self.transition(SessionEvent.CITY_DESTROYED)
             return True
         return False
 
@@ -250,6 +364,9 @@ class GameSession:
         self.active_aircraft_id = None
         self.active_encounter_id = None
         self.aircraft_sequence = 0
+        self.wave = WaveProgress()
+        self.active_aircraft_type = None
+        self.city_health = self.max_city_health
         self.stats.reset()
         self._processed_events.clear()
 

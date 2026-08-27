@@ -3,27 +3,41 @@
 from __future__ import annotations
 
 import unittest
+from math import dist
 from pathlib import Path
 from unittest.mock import patch
 
 from air_defense import config
-from air_defense.entities import AntiAircraftGun, Player, SniperRifle
+from air_defense.entities import (
+    Aircraft,
+    AntiAircraftGun,
+    CrewMember,
+    Player,
+    SniperRifle,
+    TargetBuilding,
+)
 from air_defense.rules import (
     EncounterFactory,
     LockOnTracker,
     add_reinforcement,
+    aircraft_profile,
     advance_crew_behavior,
     can_fire_anti_air,
+    can_fire_pistol,
     can_fire_sniper,
+    damage_crew_member,
     defeat_crew_member,
     drop_weapon,
     inventory_selection_allowed,
     lock_status_label,
+    apply_city_damage,
     resolve_aircraft_outcome,
     try_pickup_weapon,
+    WaveDirector,
     warning_active,
 )
 from air_defense.state import (
+    AircraftType,
     CrewBehaviorState,
     FailureReason,
     GamePhase,
@@ -31,7 +45,9 @@ from air_defense.state import (
     LockState,
     SessionEvent,
     SessionStats,
+    SquadRole,
     WeaponKind,
+    WaveProgress,
 )
 
 
@@ -86,6 +102,20 @@ class SessionStateTests(unittest.TestCase):
         self.assertEqual(session.stats.aircraft_destroyed, 0)
         self.assertIsNone(session.active_aircraft_id)
 
+    def test_city_failure_is_terminal_and_reset_clears_wave_state(self) -> None:
+        session = GameSession()
+        session.start_new_game()
+        session.transition(SessionEvent.AIRCRAFT_DESTROYED)
+
+        self.assertTrue(session.take_city_damage(config.CITY_MAX_HEALTH))
+        self.assertEqual(session.phase, GamePhase.GAME_OVER)
+        self.assertEqual(session.stats.failure_reason, FailureReason.CITY_DESTROYED)
+        self.assertEqual(session.city_health, 0.0)
+        session.transition(SessionEvent.RETURN_TO_MENU)
+        self.assertEqual(session.phase, GamePhase.MAIN_MENU)
+        self.assertEqual(session.wave.wave_number, 1)
+        self.assertEqual(session.city_health, config.CITY_MAX_HEALTH)
+
     def test_stale_aircraft_and_encounter_events_are_ignored(self) -> None:
         session = GameSession()
         session.start_new_game()
@@ -123,6 +153,13 @@ class SessionStateTests(unittest.TestCase):
         )
         self.assertEqual(session.active_encounter_id, first_encounter)
 
+        self.assertEqual(
+            session.transition(
+                SessionEvent.CREW_CLEARED,
+                encounter_id=first_encounter,
+            ),
+            GamePhase.AIRSTRIKE,
+        )
         self.assertEqual(
             session.transition(
                 SessionEvent.CREW_CLEARED,
@@ -231,6 +268,18 @@ class LockAndWeaponRuleTests(unittest.TestCase):
                 WeaponKind.ANTI_AIRCRAFT,
             )
         )
+        self.assertTrue(
+            inventory_selection_allowed(
+                GamePhase.GROUND_COMBAT,
+                WeaponKind.PISTOL,
+            )
+        )
+        self.assertFalse(
+            inventory_selection_allowed(
+                GamePhase.AIRSTRIKE,
+                WeaponKind.PISTOL,
+            )
+        )
 
 
 class GroundEncounterRuleTests(unittest.TestCase):
@@ -240,8 +289,8 @@ class GroundEncounterRuleTests(unittest.TestCase):
             random_source=FixedRandom(5),
         )
 
-        self.assertEqual(encounter.crew_count, 5)
-        self.assertEqual(len(encounter.crew), 5)
+        self.assertEqual(encounter.crew_count, 3)
+        self.assertEqual(len(encounter.crew), 3)
         self.assertEqual(
             {member.encounter_id for member in encounter.crew},
             {encounter.id},
@@ -312,6 +361,34 @@ class GroundEncounterRuleTests(unittest.TestCase):
         self.assertTrue(session.take_damage(session.health))
         self.assertEqual(session.phase, GamePhase.GAME_OVER)
         self.assertEqual(session.stats.failure_reason, FailureReason.PLAYER_DEAD)
+
+    def test_stale_or_terminal_crew_damage_is_ignored(self) -> None:
+        session = GameSession()
+        session.start_new_game()
+        session.transition(SessionEvent.AIRCRAFT_DESTROYED)
+        encounter = EncounterFactory().create_for_aircraft(
+            "aircraft-current",
+            AircraftType.MANPOWER_SUPPORT,
+        )
+        target = encounter.crew[0]
+
+        self.assertFalse(damage_crew_member(encounter, target.id, 1, session))
+        self.assertTrue(target.alive)
+
+        session.active_encounter_id = encounter.id
+        self.assertTrue(damage_crew_member(encounter, target.id, 1, session))
+        self.assertEqual(session.stats.enemies_defeated, 1)
+
+        replacement = EncounterFactory().create_for_aircraft(
+            "aircraft-replacement",
+            AircraftType.MANPOWER_SUPPORT,
+        )
+        replacement_target = replacement.crew[0]
+        session.transition(SessionEvent.PLAYER_DIED)
+        self.assertFalse(
+            damage_crew_member(replacement, replacement_target.id, 1, session)
+        )
+        self.assertTrue(replacement_target.alive)
 
 
 class StatisticsTests(unittest.TestCase):
@@ -452,6 +529,228 @@ class StatisticsTests(unittest.TestCase):
             )
 
         self.assertEqual(entity_factory.call_args.kwargs["model"], "cube")
+
+
+class AircraftTypeRuleTests(unittest.TestCase):
+    def test_aircraft_profiles_have_type_specific_health_speed_and_evasion(self) -> None:
+        normal = aircraft_profile(AircraftType.NORMAL)
+        support = aircraft_profile(AircraftType.MANPOWER_SUPPORT)
+        fast = aircraft_profile(AircraftType.FAST)
+        armored = aircraft_profile(AircraftType.ARMORED_BOSS)
+
+        self.assertEqual(normal.max_health, 1)
+        self.assertEqual(support.max_health, 1)
+        self.assertEqual(fast.max_health, 1)
+        self.assertEqual(armored.max_health, config.ARMORED_AIRCRAFT_HEALTH)
+        self.assertLess(support.flight_duration, 100.0)
+        self.assertLess(fast.flight_duration, normal.flight_duration)
+        self.assertGreater(fast.evasion_amplitude, normal.evasion_amplitude)
+
+    def test_aircraft_spawns_far_and_evasion_is_continuous(self) -> None:
+        aircraft = Aircraft(
+            id="aircraft-far",
+            aircraft_type=AircraftType.NORMAL,
+        )
+        self.assertGreater(
+            dist(aircraft.start_position, aircraft.target_position),
+            config.AIRCRAFT_FAR_SPAWN_MIN_DISTANCE,
+        )
+        start = aircraft.position
+        aircraft.advance(0.5)
+        middle = aircraft.position
+        self.assertNotEqual(start, middle)
+        self.assertLessEqual(
+            dist(start, middle),
+            dist(aircraft.start_position, aircraft.target_position) + 10.0,
+        )
+
+    def test_armored_aircraft_requires_five_valid_hits(self) -> None:
+        aircraft = Aircraft(
+            id="aircraft-armored",
+            aircraft_type=AircraftType.ARMORED_BOSS,
+        )
+        for _ in range(config.ARMORED_AIRCRAFT_HEALTH - 1):
+            self.assertFalse(aircraft.take_damage(1))
+        self.assertTrue(aircraft.take_damage(1))
+        self.assertEqual(aircraft.health, 0)
+
+        legacy_aircraft = Aircraft(
+            id="aircraft-armored-legacy",
+            aircraft_type=AircraftType.ARMORED_BOSS,
+        )
+        for _ in range(config.ARMORED_AIRCRAFT_HEALTH - 1):
+            self.assertFalse(legacy_aircraft.destroy())
+        self.assertTrue(legacy_aircraft.destroy())
+
+    def test_wave_progress_uses_requested_count_without_explicit_roster(self) -> None:
+        progress = WaveProgress(aircraft_count=5)
+
+        self.assertEqual(progress.aircraft_count, 5)
+        self.assertEqual(len(progress.roster), 5)
+
+
+class WaveRuleTests(unittest.TestCase):
+    def test_progress_advances_one_aircraft_then_builds_next_wave(self) -> None:
+        director = WaveDirector()
+        first = director.plan_wave(1).to_progress()
+        second_aircraft = director.next_progress(first)
+        next_wave = director.next_progress(second_aircraft)
+
+        self.assertEqual(second_aircraft.wave_number, 1)
+        self.assertEqual(second_aircraft.aircraft_index, 1)
+        self.assertEqual(next_wave.wave_number, 2)
+        self.assertEqual(next_wave.aircraft_count, 3)
+        self.assertEqual(next_wave.aircraft_index, 0)
+
+    def test_session_completes_same_wave_before_creating_the_next_wave(self) -> None:
+        director = WaveDirector()
+        session = GameSession()
+        session.start_new_game(director.plan_wave(1))
+
+        session.transition(
+            SessionEvent.AIRCRAFT_DESTROYED,
+            aircraft_id=session.active_aircraft_id,
+        )
+        first_encounter = session.active_encounter_id
+        session.transition(SessionEvent.CREW_CLEARED, encounter_id=first_encounter)
+        self.assertEqual(session.wave.wave_number, 1)
+        self.assertEqual(session.wave.aircraft_index, 1)
+
+        session.transition(
+            SessionEvent.AIRCRAFT_DESTROYED,
+            aircraft_id=session.active_aircraft_id,
+        )
+        second_encounter = session.active_encounter_id
+        session.transition(SessionEvent.CREW_CLEARED, encounter_id=second_encounter)
+        self.assertEqual(session.wave.wave_number, 2)
+        self.assertEqual(session.wave.aircraft_index, 0)
+        self.assertEqual(session.wave.aircraft_count, 3)
+
+    def test_wave_counts_caps_and_boss_rosters(self) -> None:
+        director = WaveDirector()
+        plans = [director.plan_wave(number) for number in range(1, 11)]
+
+        self.assertEqual(
+            [plan.aircraft_count for plan in plans[:9]],
+            [2, 3, 4, 5, 6, 7, 8, 9, 10],
+        )
+        self.assertEqual([plans[index].aircraft_cap for index in (4, 6, 8)], [6, 8, 10])
+        self.assertTrue(all(not plan.is_boss_wave for plan in plans[:9]))
+        self.assertTrue(
+            all(
+                aircraft_type != AircraftType.ARMORED_BOSS
+                for plan in plans[:9]
+                for aircraft_type in plan.roster
+            )
+        )
+        boss_plan = plans[9]
+        self.assertTrue(boss_plan.is_boss_wave)
+        self.assertEqual(
+            boss_plan.roster.count(AircraftType.ARMORED_BOSS),
+            1,
+        )
+        self.assertGreater(boss_plan.aircraft_count, 1)
+
+    def test_type_specific_encounter_counts_and_empty_encounters(self) -> None:
+        factory = EncounterFactory()
+        normal = factory.create_for_aircraft(
+            "aircraft-normal",
+            AircraftType.NORMAL,
+            random_source=FixedRandom(0),
+        )
+        support = factory.create_for_aircraft(
+            "aircraft-support",
+            AircraftType.MANPOWER_SUPPORT,
+            random_source=FixedRandom(0),
+        )
+        fast = factory.create_for_aircraft("aircraft-fast", AircraftType.FAST)
+        boss = factory.create_for_aircraft("aircraft-boss", AircraftType.ARMORED_BOSS)
+
+        self.assertEqual(normal.crew_count, 0)
+        self.assertTrue(normal.cleared)
+        self.assertEqual(support.crew_count, 6)
+        self.assertEqual(fast.crew_count, 0)
+        self.assertTrue(fast.cleared)
+        self.assertEqual(boss.crew_count, 1)
+        self.assertTrue(boss.crew[0].is_boss)
+        self.assertEqual(boss.crew[0].max_health, config.GROUND_BOSS_HEALTH)
+
+
+class ExpandedGroundRuleTests(unittest.TestCase):
+    def test_direct_boss_entity_defaults_to_boss_profile(self) -> None:
+        boss = CrewMember(
+            id="boss-direct",
+            encounter_id="encounter:boss-direct",
+            cover_node=config.COVER_NODES[0],
+            squad_role=SquadRole.COVER_SHOOTER,
+            is_boss=True,
+        )
+
+        self.assertEqual(boss.health, config.GROUND_BOSS_HEALTH)
+        self.assertEqual(boss.max_health, config.GROUND_BOSS_HEALTH)
+        self.assertEqual(boss.move_speed, config.GROUND_BOSS_MOVE_SPEED)
+
+    def test_ground_enemy_moves_with_speed_limit_instead_of_teleporting(self) -> None:
+        encounter = EncounterFactory().create_for_aircraft(
+            "aircraft-walk",
+            AircraftType.MANPOWER_SUPPORT,
+            random_source=FixedRandom(6),
+        )
+        member = encounter.crew[0]
+        start = member.position
+        target = config.COVER_NODE_POSITIONS[member.target_cover_node]
+        delta = 0.1
+
+        advance_crew_behavior(encounter, delta)
+
+        self.assertNotEqual(member.position, target)
+        self.assertLessEqual(
+            dist(start, member.position),
+            member.move_speed * delta + 1e-6,
+        )
+
+    def test_pistol_is_short_range_and_fast_cooldown(self) -> None:
+        self.assertTrue(can_fire_pistol(0.0, target_distance=11.9))
+        self.assertFalse(can_fire_pistol(0.0, target_distance=12.1))
+        self.assertFalse(can_fire_pistol(config.PISTOL_FIRE_COOLDOWN_SECONDS, target_distance=1.0))
+
+    def test_city_damage_and_ground_boss_need_repeated_hits(self) -> None:
+        building = TargetBuilding()
+        encounter = EncounterFactory().create_for_aircraft(
+            "aircraft-city",
+            AircraftType.ARMORED_BOSS,
+        )
+        boss = encounter.crew[0]
+        boss.position = config.CITY_ATTACK_POINT
+        boss.at_city = True
+
+        apply_city_damage(encounter, building, 1.0)
+        self.assertEqual(building.health, config.CITY_MAX_HEALTH - config.CITY_DAMAGE_PER_SECOND)
+
+        for _ in range(config.GROUND_BOSS_HEALTH - 1):
+            self.assertFalse(damage_crew_member(encounter, boss.id, 1))
+        self.assertTrue(damage_crew_member(encounter, boss.id, 1))
+        self.assertTrue(encounter.cleared)
+
+    def test_ground_enemy_can_reach_city_by_continuous_route_steps(self) -> None:
+        encounter = EncounterFactory().create_for_aircraft(
+            "aircraft-route",
+            AircraftType.MANPOWER_SUPPORT,
+            random_source=FixedRandom(6),
+        )
+        member = encounter.crew[0]
+        previous = member.position
+        for _ in range(1000):
+            advance_crew_behavior(encounter, 0.1)
+            self.assertLessEqual(
+                dist(previous, member.position),
+                member.move_speed * 0.1 + 1e-6,
+            )
+            previous = member.position
+            if member.at_city:
+                break
+        self.assertTrue(member.at_city)
+        self.assertEqual(member.position, config.CITY_ATTACK_POINT)
 
 
 if __name__ == "__main__":
