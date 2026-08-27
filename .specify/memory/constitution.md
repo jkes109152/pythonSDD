@@ -1,8 +1,8 @@
 <!--
 Sync Impact Report
-- Version change: unratified template -> 1.0.0
-- Modified principles: five template placeholders -> five project-specific principles
-- Added sections: 技術與範圍限制、開發流程與品質門檻
+- Version change: 1.0.0 -> 1.1.0
+- Modified principles: none
+- Added sections: Spec-kit 分支命名、PR 合併清理與 Release 來源治理規則
 - Removed sections: none
 - Deferred TODOs: none
 -->
@@ -102,4 +102,20 @@ Sync Impact Report
 章節或實質擴充規則；PATCH 代表不改變治理意義的澄清、修正與文字整理。每次修訂 MUST
 在交付或審查時確認版本、影響報告、日期格式與原則可驗證性一致。
 
-**Version**: 1.0.0 | **Ratified**: 2026-08-26 | **Last Amended**: 2026-08-26
+Spec-kit 與 Git 交付流程另遵守以下規則：
+
+1. 功能分支 MUST 使用 `.specify/scripts/powershell/create-new-feature.ps1` 或其等價的
+   Spec-kit 產生流程建立，命名格式 MUST 為 `NNN-short-name`：三位以上的數字編號、
+   小寫英數字與單一連字號；不得自行加上 `codex/` 或其他未經規範的前綴。功能分支與
+   `specs/` 下對應的功能目錄 SHOULD 使用相同識別名稱，若不同 MUST 在計畫文件說明
+   對應關係。
+2. 功能分支完成後 MUST 推送至遠端並建立以 `main` 為 base 的 PR；PR MUST 說明對應的
+   `spec.md`、`plan.md`、`tasks.md`、驗證結果與已知限制。未通過 code review、語法檢查、
+   自動化測試與必要的手動驗證前，不得宣告可合併。
+3. PR 合併後 MUST 先確認合併 commit 已存在於 `main`，再刪除遠端功能分支與本地功能
+   分支；刪除前不得假設 PR 已合併。清理分支時 MUST 保留不屬於該功能的工作區變更。
+4. Release MUST 從已合併且已驗證的 `main` 建立，並使用明確記錄的語意化版本 tag；沒有
+   既有版本規範時，建立正式 Release 前 MUST 先確認版本號，不得從尚未合併的功能分支
+   直接建立正式版本。
+
+**Version**: 1.1.0 | **Ratified**: 2026-08-26 | **Last Amended**: 2026-08-27
