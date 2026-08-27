@@ -6,11 +6,19 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from air_defense.entities import Aircraft
+from air_defense.entities import Aircraft, AntiAircraftGun, Pistol, SniperRifle
+from air_defense.hud import GameHUD
 from air_defense.main import AirDefenseGame
 from air_defense.rules import LockOnTracker
 from air_defense.scene import AirDefenseScene
-from air_defense.state import AircraftType, GamePhase, GameSession, SessionEvent
+from air_defense.state import (
+    AircraftPhase,
+    AircraftType,
+    FailureReason,
+    GamePhase,
+    GameSession,
+    SessionEvent,
+)
 
 
 class TerminalGuidanceResetTests(unittest.TestCase):
@@ -103,6 +111,124 @@ class TerminalGuidanceResetTests(unittest.TestCase):
             scene.clear_dynamic()
             destroy.assert_called_once_with(effect)
             self.assertEqual(scene._effects, [])
+
+    def test_lock_reticle_color_reaches_visible_segments(self) -> None:
+        reticle = SimpleNamespace(
+            color=None,
+            children=[SimpleNamespace(color=None), SimpleNamespace(color=None)],
+        )
+        tint = (0.2, 1.0, 0.35, 1.0)
+
+        GameHUD._set_reticle_color(reticle, tint)
+
+        self.assertEqual(reticle.color, tint)
+        self.assertEqual([child.color for child in reticle.children], [tint, tint])
+
+    def test_game_over_keeps_status_card_root_for_final_snapshot(self) -> None:
+        hud = GameHUD.__new__(GameHUD)
+        hud.menu_root = SimpleNamespace(enabled=True)
+        hud.gameplay_root = SimpleNamespace(enabled=False)
+        hud.game_over_root = SimpleNamespace(enabled=False)
+        hud.failure_text = SimpleNamespace(text="")
+        hud.final_stats_text = SimpleNamespace(text="")
+        stats = SimpleNamespace(
+            failure_reason=None,
+            survival_seconds=1.0,
+            aircraft_destroyed=2,
+            enemies_defeated=3,
+        )
+
+        hud.show_game_over(stats)
+
+        self.assertTrue(hud.gameplay_root.enabled)
+        self.assertTrue(hud.game_over_root.enabled)
+        self.assertFalse(hud.menu_root.enabled)
+
+    def test_scene_removal_forgets_aircraft_and_child_references(self) -> None:
+        scene = AirDefenseScene.__new__(AirDefenseScene)
+        aircraft = SimpleNamespace(parent=None, aircraft_id="aircraft-a")
+        wing = SimpleNamespace(parent=aircraft)
+        scene.aircraft_entity = aircraft
+        scene.aircraft_entities = {"aircraft-a": aircraft}
+        scene.crew_entities = {}
+        scene.missile_entities = {}
+        scene._dynamic_entities = [aircraft, wing]
+
+        with patch("air_defense.scene.destroy") as destroy:
+            scene.remove_aircraft("aircraft-a")
+
+        self.assertEqual(scene._dynamic_entities, [])
+        self.assertEqual(scene.aircraft_entities, {})
+        self.assertIsNone(scene.aircraft_entity)
+        destroy.assert_called_once_with(aircraft)
+
+
+class WholeWaveLifecycleTests(unittest.TestCase):
+    def _runtime_session(self) -> tuple[GameSession, tuple[str, ...]]:
+        session = GameSession()
+        session.start_new_game()
+        ids = ("aircraft-wave-1", "aircraft-wave-2")
+        session.initialize_wave_runtime(
+            ids,
+            {
+                ids[0]: AircraftType.NORMAL,
+                ids[1]: AircraftType.MANPOWER_SUPPORT,
+            },
+        )
+        return session, ids
+
+    def test_partial_destroy_stays_airstrike_and_duplicate_is_ignored(self) -> None:
+        session, ids = self._runtime_session()
+
+        self.assertTrue(session.mark_aircraft_destroyed(ids[0]))
+        self.assertFalse(session.mark_aircraft_destroyed(ids[0]))
+        self.assertEqual(session.phase, GamePhase.AIRSTRIKE)
+        self.assertEqual(session.wave_runtime.remaining_aircraft_count, 1)
+        self.assertEqual(session.stats.aircraft_destroyed, 1)
+
+        self.assertEqual(
+            session.transition(SessionEvent.AIRCRAFT_DESTROYED, aircraft_id=ids[1]),
+            GamePhase.GROUND_COMBAT,
+        )
+        self.assertEqual(session.wave_runtime.remaining_aircraft_count, 0)
+        self.assertEqual(session.active_encounter_id, "encounter:wave-1")
+
+    def test_impact_marks_only_terminal_failure_and_freezes_progress(self) -> None:
+        session, ids = self._runtime_session()
+
+        self.assertEqual(
+            session.transition(SessionEvent.BUILDING_IMPACT, aircraft_id=ids[1]),
+            GamePhase.GAME_OVER,
+        )
+        self.assertEqual(
+            session.wave_runtime.aircraft_statuses[ids[1]],
+            AircraftPhase.IMPACTED,
+        )
+        snapshot = session.stats.snapshot()
+        session.tick(10.0)
+        self.assertEqual(session.stats.snapshot(), snapshot)
+        self.assertEqual(session.stats.failure_reason, FailureReason.BUILDING_IMPACT)
+        self.assertEqual(
+            session.transition(SessionEvent.AIRCRAFT_DESTROYED, aircraft_id=ids[0]),
+            GamePhase.GAME_OVER,
+        )
+
+    def test_weapon_boundary_reset_is_central_and_scope_close_preserves_cd(self) -> None:
+        game = AirDefenseGame.__new__(AirDefenseGame)
+        game.anti_aircraft = AntiAircraftGun(world_position=(0, 0, 0))
+        game.sniper = SniperRifle(world_position=(0, 0, 0))
+        game.pistol = Pistol(world_position=(0, 0, 0))
+        game.anti_aircraft.fire_cooldown = 1.0
+        game.sniper.fire_cooldown = 0.5
+        game.pistol.fire_cooldown = 0.1
+        game.sniper.toggle_scope()
+        game.sniper.toggle_scope()
+        self.assertEqual(game.sniper.fire_cooldown, 0.5)
+        self.assertEqual(game.reset_weapon_cooldowns(), 3)
+        self.assertEqual(
+            (game.anti_aircraft.fire_cooldown, game.sniper.fire_cooldown, game.pistol.fire_cooldown),
+            (0.0, 0.0, 0.0),
+        )
 
 
 if __name__ == "__main__":

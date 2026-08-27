@@ -15,10 +15,14 @@ from air_defense.rules import (
     clamp_screen_radius,
     direction_to_yaw_pitch,
     is_inside_lock_zone,
+    is_inside_expanded_lock_frame,
+    is_inside_lock_frame,
+    lock_frame_bounds,
     lock_zone_radius,
     normalize_vector,
     raycast_hit_matches_target,
     screen_distance_from_center,
+    select_lock_target,
     steer_forward,
     swept_segment_hits_sphere,
     tracking_ring_radius,
@@ -128,6 +132,25 @@ class LockGeometryTests(unittest.TestCase):
         )
         self.assertFalse(raycast_hit_matches_target(SimpleNamespace(hit=False, entity=wing), aircraft))
 
+    def test_rectangular_frame_selection_and_clamped_reticle(self) -> None:
+        width, height = 1280.0, 720.0
+        left, bottom, right, top = lock_frame_bounds(width, height)
+        self.assertTrue(is_inside_lock_frame((left, top), width, height))
+        self.assertFalse(is_inside_lock_frame((left - 0.1, top), width, height))
+        self.assertTrue(is_inside_expanded_lock_frame((right + 1.0, height / 2), width, height))
+        candidates = [
+            SimpleNamespace(aircraft_id="late", visible=True, in_lock_frame=True, distance_from_center=6.0),
+            SimpleNamespace(aircraft_id="early", visible=True, in_lock_frame=True, distance_from_center=3.0),
+        ]
+        self.assertEqual(select_lock_target(candidates).aircraft_id, "early")
+        out_of_frame = SimpleNamespace(
+            aircraft_id="early", visible=True, in_lock_frame=False, distance_from_center=100.0
+        )
+        self.assertEqual(
+            select_lock_target([out_of_frame], "early", lock_progress=0.2).aircraft_id,
+            "early",
+        )
+
 
 class LockDecayRuleTests(unittest.TestCase):
     def test_partial_decay_preserves_progress_and_reentry_resumes(self) -> None:
@@ -170,6 +193,16 @@ class LockDecayRuleTests(unittest.TestCase):
             )
         )
         self.assertFalse(can_fire_anti_air(LockState.GREEN_READY, 0.0))
+
+    def test_target_switch_resets_progress_but_reentry_keeps_sticky_target(self) -> None:
+        tracker = LockOnTracker(scope_enabled=True)
+        tracker.set_target("aircraft-a")
+        tracker.update(target_visible=True, target_in_frame=True, delta_seconds=1.5)
+        tracker.update(target_visible=True, target_in_frame=False, delta_seconds=0.25)
+        self.assertEqual(tracker.target_aircraft_id, "aircraft-a")
+        tracker.set_target("aircraft-b")
+        self.assertEqual(tracker.progress, 0.0)
+        self.assertEqual(tracker.state, LockState.WHITE)
 
 
 class AircraftFlightRuleTests(unittest.TestCase):

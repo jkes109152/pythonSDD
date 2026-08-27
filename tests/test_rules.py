@@ -51,14 +51,17 @@ from air_defense.state import (
     SquadRole,
     WeaponKind,
     WaveProgress,
+    WaveRuntime,
 )
 
 
 class FixedRandom:
     def __init__(self, value: int) -> None:
         self.value = value
+        self.calls: list[tuple[int, int]] = []
 
     def randint(self, minimum: int, maximum: int) -> int:
+        self.calls.append((minimum, maximum))
         return max(minimum, min(maximum, self.value))
 
 
@@ -687,6 +690,40 @@ class WaveRuleTests(unittest.TestCase):
         self.assertEqual(boss.crew_count, 1)
         self.assertTrue(boss.crew[0].is_boss)
         self.assertEqual(boss.crew[0].max_health, config.GROUND_BOSS_HEALTH)
+
+    def test_encounter_factory_honors_custom_normal_crew_bounds(self) -> None:
+        source = FixedRandom(0)
+
+        encounter = EncounterFactory(minimum=2, maximum=2).create_for_aircraft(
+            "aircraft-custom-count",
+            AircraftType.NORMAL,
+            random_source=source,
+        )
+
+        self.assertEqual(source.calls, [(2, 2)])
+        self.assertEqual(encounter.crew_count, 2)
+
+    def test_aggregate_wave_factory_uses_one_random_draw_per_normal_source(self) -> None:
+        ids = ("wave-a", "wave-b", "wave-c")
+        types = {
+            ids[0]: AircraftType.NORMAL,
+            ids[1]: AircraftType.MANPOWER_SUPPORT,
+            ids[2]: AircraftType.FAST,
+        }
+        runtime = WaveRuntime(
+            WaveDirector().plan_wave(4, aircraft_count=3, cap=6).to_progress(),
+            ids,
+            aircraft_types=types,
+        )
+        self.assertTrue(runtime.mark_destroyed(ids[0]))
+        self.assertFalse(runtime.mark_destroyed(ids[0]))
+        source = FixedRandom(2)
+        encounter = EncounterFactory().create_for_wave(4, ids, types, source)
+        self.assertEqual(encounter.id, "encounter:wave-4")
+        self.assertEqual(encounter.source_aircraft_ids, ids)
+        self.assertEqual(len(source.calls), 1)
+        self.assertEqual(len(encounter.crew), 2 + config.MANPOWER_SUPPORT_CREW)
+        self.assertTrue(all(member.encounter_id == encounter.id for member in encounter.crew))
 
 
 class ExpandedGroundRuleTests(unittest.TestCase):

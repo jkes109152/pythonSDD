@@ -370,6 +370,69 @@ class GuidedMissile:
 
 
 @dataclass
+class GroundTracerEffect:
+    """Short-lived ground-fire visual; it never owns gameplay damage."""
+
+    id: str
+    start_position: tuple[float, float, float]
+    target_position: tuple[float, float, float]
+    remaining_seconds: float = config.GROUND_TRACER_LIFETIME_SECONDS
+    lifetime_seconds: float = config.GROUND_TRACER_LIFETIME_SECONDS
+    travel_progress: float = 0.0
+    tail_length: float = config.GROUND_TRACER_TAIL_LENGTH
+    visual_color: tuple[float, float, float] = config.YELLOW_RGB
+    expired: bool = False
+
+    def __post_init__(self) -> None:
+        self.start_position = tuple(float(value) for value in self.start_position)
+        self.target_position = tuple(float(value) for value in self.target_position)
+        self.lifetime_seconds = max(1e-6, float(self.lifetime_seconds))
+        self.remaining_seconds = max(
+            0.0,
+            min(self.lifetime_seconds, float(self.remaining_seconds)),
+        )
+        self.travel_progress = max(0.0, min(1.0, float(self.travel_progress)))
+        self.tail_length = max(0.0, float(self.tail_length))
+        self.visual_color = tuple(float(value) for value in self.visual_color)  # type: ignore[assignment]
+        self.expired = self.remaining_seconds <= 0.0
+
+    @property
+    def head_position(self) -> tuple[float, float, float]:
+        return tuple(
+            self.start_position[index]
+            + (self.target_position[index] - self.start_position[index]) * self.travel_progress
+            for index in range(3)
+        )
+
+    @property
+    def tail_position(self) -> tuple[float, float, float]:
+        head = self.head_position
+        direction = normalize_vector(
+            tuple(
+                self.target_position[index] - self.start_position[index]
+                for index in range(3)
+            )
+        )
+        return tuple(
+            head[index] - direction[index] * self.tail_length
+            for index in range(3)
+        )
+
+    def advance(self, delta_seconds: float) -> bool:
+        """Advance the visual head linearly and return whether it expired."""
+
+        if self.expired:
+            return True
+        delta_seconds = max(0.0, float(delta_seconds))
+        elapsed = self.lifetime_seconds - self.remaining_seconds
+        elapsed = min(self.lifetime_seconds, elapsed + delta_seconds)
+        self.remaining_seconds = max(0.0, self.lifetime_seconds - elapsed)
+        self.travel_progress = min(1.0, elapsed / self.lifetime_seconds)
+        self.expired = self.travel_progress >= 1.0 or self.remaining_seconds <= 0.0
+        return self.expired
+
+
+@dataclass
 class CrewMember:
     id: str
     encounter_id: str
@@ -388,6 +451,7 @@ class CrewMember:
     is_boss: bool = False
     at_city: bool = False
     city_attack_elapsed: float = 0.0
+    attack_sequence: int = 0
 
     def __post_init__(self) -> None:
         if self.is_boss:
@@ -426,6 +490,7 @@ class CrewMember:
 
     def mark_attacked(self) -> None:
         self.attack_cooldown = config.CREW_ATTACK_COOLDOWN_SECONDS
+        self.attack_sequence += 1
 
     def next_cover_node(self) -> str:
         current = self.cover_node or config.COVER_NODES[0]
@@ -445,10 +510,18 @@ class GroundEncounter:
     aircraft_type: AircraftType = AircraftType.NORMAL
     boss_id: Optional[str] = None
     city_damage_accumulator: float = 0.0
+    source_aircraft_ids: tuple[str, ...] = ()
+    group_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.crew_count = len(self.crew) if self.crew_count == 0 else self.crew_count
         self.aircraft_type = AircraftType(self.aircraft_type)
+        if not self.source_aircraft_ids:
+            self.source_aircraft_ids = (self.aircraft_id,)
+        else:
+            self.source_aircraft_ids = tuple(str(item) for item in self.source_aircraft_ids)
+        if self.group_id is not None:
+            self.group_id = str(self.group_id)
         if self.boss_id is None:
             boss = next((member for member in self.crew if member.is_boss), None)
             self.boss_id = boss.id if boss is not None else None
@@ -456,7 +529,7 @@ class GroundEncounter:
 
     @property
     def id(self) -> str:
-        return f"encounter:{self.aircraft_id}"
+        return f"encounter:{self.group_id or self.aircraft_id}"
 
     @property
     def alive_crew(self) -> list[CrewMember]:
