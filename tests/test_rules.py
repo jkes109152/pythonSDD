@@ -258,43 +258,14 @@ class LockAndWeaponRuleTests(unittest.TestCase):
         self.assertTrue(can_fire_sniper(0.0, WeaponKind.SNIPER))
         self.assertFalse(can_fire_sniper(0.01, WeaponKind.SNIPER))
 
-    def test_inventory_slots_are_direct_and_phase_limited(self) -> None:
-        self.assertTrue(
-            inventory_selection_allowed(
-                GamePhase.AIRSTRIKE,
-                WeaponKind.ANTI_AIRCRAFT,
-            )
-        )
-        self.assertTrue(
-            inventory_selection_allowed(
-                GamePhase.GROUND_COMBAT,
-                WeaponKind.SNIPER,
-            )
-        )
-        self.assertFalse(
-            inventory_selection_allowed(
-                GamePhase.AIRSTRIKE,
-                WeaponKind.SNIPER,
-            )
-        )
-        self.assertFalse(
-            inventory_selection_allowed(
-                GamePhase.GROUND_COMBAT,
-                WeaponKind.ANTI_AIRCRAFT,
-            )
-        )
-        self.assertTrue(
-            inventory_selection_allowed(
-                GamePhase.GROUND_COMBAT,
-                WeaponKind.PISTOL,
-            )
-        )
-        self.assertFalse(
-            inventory_selection_allowed(
-                GamePhase.AIRSTRIKE,
-                WeaponKind.PISTOL,
-            )
-        )
+    def test_inventory_slots_are_direct_and_not_phase_limited(self) -> None:
+        for phase in (
+            GamePhase.AIRSTRIKE,
+            GamePhase.HYBRID_COMBAT,
+            GamePhase.GROUND_COMBAT,
+        ):
+            for weapon in WeaponKind:
+                self.assertTrue(inventory_selection_allowed(phase, weapon))
 
 
 class GroundEncounterRuleTests(unittest.TestCase):

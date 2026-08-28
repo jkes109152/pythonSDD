@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import unittest
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from air_defense.entities import Aircraft, AntiAircraftGun, Pistol, SniperRifle
+from ursina import Vec3
+
+from air_defense.entities import (
+    Aircraft,
+    AntiAircraftGun,
+    GroundEncounter,
+    Pistol,
+    RPGWeapon,
+    SniperRifle,
+)
 from air_defense.hud import GameHUD
 from air_defense.main import AirDefenseGame
 from air_defense.rules import LockOnTracker
 from air_defense.rules import EncounterFactory, WaveDirector
 from air_defense.scene import AirDefenseScene
+from air_defense.save_data import SaveStore
 from air_defense.state import (
     AircraftPhase,
     AircraftType,
@@ -194,6 +205,28 @@ class WholeWaveLifecycleTests(unittest.TestCase):
         )
         self.assertEqual(session.wave_runtime.remaining_aircraft_count, 0)
         self.assertIsNone(session.active_encounter_id)
+
+    def test_runstate_ground_encounter_repairs_stale_controller_cache(self) -> None:
+        game = AirDefenseGame.__new__(AirDefenseGame)
+        authoritative = GroundEncounter(
+            aircraft_id="wave-1",
+            crew=[],
+            group_id="wave-1",
+        )
+        stale = GroundEncounter(
+            aircraft_id="wave-old",
+            crew=[],
+            group_id="wave-old",
+        )
+        game.session = SimpleNamespace(
+            run_state=SimpleNamespace(ground_encounter=authoritative),
+        )
+        game.encounter = stale
+
+        selected = game._current_ground_encounter()
+
+        self.assertIs(selected, authoritative)
+        self.assertIs(game.encounter, authoritative)
 
     def test_impact_marks_only_terminal_failure_and_freezes_progress(self) -> None:
         session, ids = self._runtime_session()
@@ -400,6 +433,90 @@ class WeaponFireGuardTests(unittest.TestCase):
         game._fire_sniper()
 
         self.assertEqual(game.sniper.fire_cooldown, 0.0)
+
+
+class RpgCompletionLifecycleTests(unittest.TestCase):
+    def test_rpg_clearing_last_ground_batch_settles_the_sublevel(self) -> None:
+        """RPG 的多目標擊倒必須走與其他武器相同的通關結算邊界。"""
+
+        with TemporaryDirectory() as temporary_directory:
+            store = SaveStore(temporary_directory)
+            session = GameSession(save_store=store)
+            session.select_save_slot(1)
+            assert session.profile is not None
+            session.profile.unlocked_weapons.append(WeaponKind.RPG.value)
+            run = session.start_sublevel(level_key="1-1")
+            aircraft_id = next(iter(run.aircrafts))
+            aircraft_type = run.aircrafts[aircraft_id]["aircraft_type"]
+
+            factory = EncounterFactory(minimum=2, maximum=2)
+            batch = factory.create_drop_batch(
+                aircraft_id,
+                aircraft_type,
+                "encounter:wave-1",
+                (0.0, 0.0, 0.0),
+                random_source=SimpleNamespace(randint=lambda lower, upper: lower),
+            )
+            encounter = GroundEncounter(
+                aircraft_id="wave-1",
+                group_id="wave-1",
+                crew=list(batch),
+                source_aircraft_ids=(aircraft_id,),
+            )
+            session.mark_aircraft_destroyed(aircraft_id)
+            session.transition(
+                SessionEvent.DROP_STARTED,
+                event_id=f"drop-started:1:{aircraft_id}",
+                aircraft_id=aircraft_id,
+                encounter_id=encounter.id,
+            )
+            run.ground_encounter = encounter
+
+            game = AirDefenseGame.__new__(AirDefenseGame)
+            game.session = session
+            game.encounter = None
+            game.aircraft = None
+            game.aircrafts = {}
+            game.encounter_factory = factory
+            game.lock_tracker = LockOnTracker()
+            game.multi_lock_tracker = SimpleNamespace(reset=lambda: None)
+            game.anti_aircraft = AntiAircraftGun(world_position=(0.0, 0.0, 0.0))
+            game.sniper = SniperRifle(world_position=(0.0, 0.0, 0.0))
+            game.pistol = Pistol(world_position=(0.0, 0.0, 0.0))
+            game.rpg = RPGWeapon(
+                world_position=(0.0, 0.0, 0.0),
+                ammo_remaining=1,
+                damage=1,
+            )
+            game.multi_anti_aircraft = None
+            game.turrets = []
+            game.active_missiles = {}
+            game._rpg_explosion_sequence = 0
+            game._aircraft_screen_target = None
+            game._aircraft_screen_targets = {}
+            game._tracer_event_ids = set()
+            game._hit_feedback_seconds = 0.0
+            game.scene = Mock(world=None)
+            game.scene.player_position.return_value = Vec3(0.0, 0.0, 0.0)
+            game.scene.crew_under_center.return_value = batch[0].id
+            game.hud = Mock()
+            session.held_weapon = WeaponKind.RPG
+
+            game._fire_rpg()
+
+            self.assertEqual(
+                session.phase,
+                GamePhase.MAIN_MENU,
+                msg=(
+                    f"phase={session.phase}, alive={encounter.alive_crew}, "
+                    f"cleared={encounter.cleared}, runtime={session.wave_runtime}"
+                ),
+            )
+            self.assertIsNone(session.run_state)
+            self.assertEqual(session.profile.last_completed_a_b, "1-1")
+            self.assertGreater(session.profile.coins, 0)
+            self.assertEqual(game.rpg.ammo_remaining, 0)
+            self.assertEqual(game.scene.remove_crew_member.call_count, len(batch))
 
 
 if __name__ == "__main__":

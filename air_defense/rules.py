@@ -34,6 +34,14 @@ from .state import (
     WaveRuntime,
     WeaponKind,
 )
+from .progression import (
+    LevelKey,
+    LevelPlan,
+    ProgressionConfig,
+    DEFAULT_CONFIG,
+    build_level_plan,
+    effective_cooldown,
+)
 
 if TYPE_CHECKING:
     from .entities import GroundEncounter
@@ -185,6 +193,117 @@ class LockOnTracker:
         if self.state != LockState.RED_TRACKING or half_period <= 0:
             return self.state == LockState.RED_TRACKING
         return int(self.lock_elapsed / half_period) % 2 == 0
+
+
+class MultiLockOnTracker:
+    """多目標防空炮的有序鎖定追蹤器。
+
+    每個目標使用獨立的 `LockOnTracker`，因此切換其中一個目標不會重置
+    其他目標的鎖定進度；齊射時由 `fireable_targets` 產生去重快照。
+    """
+
+    def __init__(
+        self,
+        target_capacity: int = 2,
+        lock_duration: float = LOCK_DURATION_SECONDS,
+        decay_duration: float = AA_LOCK_DECAY_SECONDS,
+    ) -> None:
+        self.target_capacity = max(0, int(target_capacity))
+        self.lock_duration = max(1e-6, float(lock_duration))
+        self.decay_duration = max(1e-6, float(decay_duration))
+        self.targets: list[str] = []
+        self.trackers: dict[str, LockOnTracker] = {}
+        self.volley_id: Optional[str] = None
+
+    @property
+    def target_ids(self) -> tuple[str, ...]:
+        return tuple(self.targets)
+
+    @property
+    def lock_progress(self) -> dict[str, float]:
+        return {target_id: self.trackers[target_id].progress for target_id in self.targets}
+
+    @property
+    def ready_target_ids(self) -> tuple[str, ...]:
+        return tuple(
+            target_id
+            for target_id in self.targets
+            if self.trackers[target_id].fireable
+        )
+
+    def set_targets(self, target_ids: Sequence[str]) -> tuple[str, ...]:
+        ordered: list[str] = []
+        for target_id in target_ids:
+            value = str(target_id)
+            if value not in ordered:
+                ordered.append(value)
+            if len(ordered) >= self.target_capacity:
+                break
+        old = self.trackers
+        self.targets = ordered
+        self.trackers = {
+            target_id: old.get(
+                target_id,
+                LockOnTracker(
+                    self.lock_duration,
+                    self.decay_duration,
+                    scope_enabled=True,
+                    target_aircraft_id=target_id,
+                ),
+            )
+            for target_id in ordered
+        }
+        for tracker in self.trackers.values():
+            tracker.scope_enabled = True
+        return self.target_ids
+
+    def update(
+        self,
+        candidates: Mapping[str, object] | Sequence[object],
+        delta_seconds: float,
+        *,
+        scope_enabled: bool = True,
+    ) -> tuple[str, ...]:
+        candidate_map: dict[str, object] = {}
+        values = candidates.values() if isinstance(candidates, Mapping) else candidates
+        for candidate in values:
+            candidate_id = _candidate_id(candidate)
+            if candidate_id is not None:
+                candidate_map[candidate_id] = candidate
+        if not scope_enabled:
+            self.reset()
+            return ()
+        for target_id in tuple(self.targets):
+            candidate = candidate_map.get(target_id)
+            tracker = self.trackers[target_id]
+            visible = bool(getattr(candidate, "visible", candidate is not None))
+            in_frame = _candidate_in_frame(candidate) if candidate is not None else False
+            tracker.update(
+                delta_seconds=delta_seconds,
+                target_visible=visible,
+                target_in_frame=in_frame,
+                target_aircraft_id=target_id,
+            )
+        return self.ready_target_ids
+
+    def fireable_targets(self) -> tuple[str, ...]:
+        return self.ready_target_ids
+
+    def mark_fired(self, volley_id: Optional[str] = None) -> tuple[str, ...]:
+        ready = self.ready_target_ids
+        if not ready:
+            return ()
+        self.volley_id = str(volley_id) if volley_id is not None else None
+        for target_id in ready:
+            self.trackers[target_id].reset()
+            self.trackers[target_id].scope_enabled = True
+            self.trackers[target_id].target_aircraft_id = target_id
+        return ready
+
+    def reset(self) -> None:
+        self.targets.clear()
+        self.trackers.clear()
+        self.volley_id = None
 
 
 Vector3 = tuple[float, float, float]
@@ -713,6 +832,9 @@ def _weapon_lookup(weapons: Mapping[object, object]) -> dict[WeaponKind, object]
         "anti_aircraft": WeaponKind.ANTI_AIRCRAFT,
         "sniper": WeaponKind.SNIPER,
         "pistol": WeaponKind.PISTOL,
+        "rpg": WeaponKind.RPG,
+        "multi_aa": WeaponKind.MULTI_ANTI_AIRCRAFT,
+        "multi_anti_aircraft": WeaponKind.MULTI_ANTI_AIRCRAFT,
     }
     for key, value in weapons.items():
         kind = key if isinstance(key, WeaponKind) else aliases.get(str(key))
@@ -726,6 +848,8 @@ def weapon_cooldown_view(
     weapons: Mapping[object, object],
     *,
     gameplay: bool = True,
+    profile: Optional[object] = None,
+    progression_config: ProgressionConfig = DEFAULT_CONFIG,
 ) -> Optional[WeaponCooldownView]:
     if weapon is None or not gameplay:
         return None
@@ -734,6 +858,9 @@ def weapon_cooldown_view(
         "anti_aircraft": WeaponKind.ANTI_AIRCRAFT,
         "sniper": WeaponKind.SNIPER,
         "pistol": WeaponKind.PISTOL,
+        "rpg": WeaponKind.RPG,
+        "multi_aa": WeaponKind.MULTI_ANTI_AIRCRAFT,
+        "multi_anti_aircraft": WeaponKind.MULTI_ANTI_AIRCRAFT,
     }
     kind = weapon if isinstance(weapon, WeaponKind) else aliases.get(str(weapon))
     if kind is None:
@@ -741,12 +868,21 @@ def weapon_cooldown_view(
     source = _weapon_lookup(weapons).get(kind)
     if source is None:
         return None
-    durations = {
+    base_durations = {
         WeaponKind.ANTI_AIRCRAFT: config.AA_FIRE_COOLDOWN_SECONDS,
         WeaponKind.SNIPER: config.SNIPER_FIRE_COOLDOWN_SECONDS,
         WeaponKind.PISTOL: config.PISTOL_FIRE_COOLDOWN_SECONDS,
+        WeaponKind.RPG: progression_config.rpg_cooldown_seconds,
+        WeaponKind.MULTI_ANTI_AIRCRAFT: config.AA_FIRE_COOLDOWN_SECONDS,
     }
-    duration = max(1e-6, float(durations[kind]))
+    duration = float(base_durations[kind])
+    if profile is not None:
+        duration = effective_cooldown(
+            duration,
+            profile,
+            config=progression_config,
+        )
+    duration = max(1e-6, duration)
     remaining = min(
         duration,
         max(0.0, float(getattr(source, "fire_cooldown", 0.0))),
@@ -919,15 +1055,23 @@ def inventory_selection_allowed(
     phase: GamePhase,
     requested_weapon: WeaponKind,
 ) -> bool:
-    """Return whether an inventory slot is usable in the current phase."""
+    """判定戰鬥中能否切換武器；目標合法性由開火規則另行判定。"""
 
-    return (
-        phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT)
-        and requested_weapon == WeaponKind.ANTI_AIRCRAFT
-    ) or (
-        phase in (GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
-        and requested_weapon in (WeaponKind.SNIPER, WeaponKind.PISTOL)
-    )
+    try:
+        requested = WeaponKind(requested_weapon)
+    except (TypeError, ValueError):
+        return False
+    return phase in (
+        GamePhase.AIRSTRIKE,
+        GamePhase.HYBRID_COMBAT,
+        GamePhase.GROUND_COMBAT,
+    ) and requested in tuple(WeaponKind)
+
+
+def weapon_selection_allowed(phase: GamePhase, requested_weapon: WeaponKind) -> bool:
+    """`inventory_selection_allowed` 的語意化別名。"""
+
+    return inventory_selection_allowed(phase, requested_weapon)
 
 
 def cooldown_ready(cooldown_remaining: float) -> bool:
@@ -952,7 +1096,7 @@ def can_fire_anti_air(
     in_frame = bool(target_in_zone if target_in_frame is None else target_in_frame)
     visible = bool(in_frame if target_visible is None else target_visible)
     return (
-        held_weapon == WeaponKind.ANTI_AIRCRAFT
+        held_weapon in (WeaponKind.ANTI_AIRCRAFT, WeaponKind.MULTI_ANTI_AIRCRAFT)
         and lock_state == LockState.GREEN_READY
         and cooldown_ready(cooldown_remaining)
         and in_frame
@@ -1027,6 +1171,283 @@ def can_fire_pistol(
     )
 
 
+def _object_value(target: object, name: str, default: object = None) -> object:
+    if isinstance(target, Mapping):
+        return target.get(name, default)
+    return getattr(target, name, default)
+
+
+def target_identifier(target: object) -> Optional[str]:
+    value = _object_value(target, "aircraft_id")
+    if value is None:
+        value = _object_value(target, "id")
+    if value is None:
+        value = _object_value(target, "crew_id")
+    return str(value) if value is not None else None
+
+
+def target_position(target: object) -> Optional[Vector3]:
+    value = _object_value(target, "position")
+    if value is None:
+        return None
+    try:
+        return tuple(float(component) for component in value)  # type: ignore[return-value]
+    except (TypeError, ValueError):
+        return None
+
+
+def _target_is_aircraft(target: object) -> bool:
+    explicit = _object_value(target, "is_aircraft")
+    if explicit is not None:
+        return bool(explicit)
+    if _object_value(target, "behavior_state") is not None:
+        return False
+    if _object_value(target, "aircraft_type") is not None:
+        return True
+    target_type = str(_object_value(target, "target_type", "")).lower()
+    return target_type in {"aircraft", "plane", "飛機"}
+
+
+def _target_is_alive(target: object) -> bool:
+    alive = _object_value(target, "alive")
+    if alive is not None:
+        return bool(alive)
+    phase = _object_value(target, "phase")
+    if phase in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED, "DESTROYED", "IMPACTED"):
+        return False
+    health = _object_value(target, "health")
+    return health is None or float(health) > 0.0
+
+
+def _target_is_boss(target: object) -> bool:
+    if bool(_object_value(target, "is_boss", False)):
+        return True
+    aircraft_type = _object_value(target, "aircraft_type")
+    return aircraft_type in (AircraftType.ARMORED_BOSS, "ARMORED_BOSS", "魔")
+
+
+def _target_is_landed(target: object) -> bool:
+    landed = _object_value(target, "landed")
+    if landed is not None:
+        return bool(landed)
+    state = _object_value(target, "behavior_state")
+    if state is None:
+        return True
+    return state not in (CrewBehaviorState.DESCENDING, "DESCENDING", "下降中")
+
+
+def is_valid_target(
+    weapon: WeaponKind | str,
+    target: object,
+    *,
+    distance: Optional[float] = None,
+    cooldown_remaining: float = 0.0,
+    ammo_remaining: Optional[int] = None,
+    max_range: Optional[float] = None,
+) -> bool:
+    """集中判定武器目標、射程、冷卻與彈藥，不受戰鬥階段限制。"""
+
+    try:
+        kind = weapon if isinstance(weapon, WeaponKind) else WeaponKind(weapon)
+    except (TypeError, ValueError):
+        return False
+    if target is None or not _target_is_alive(target):
+        return False
+    if float(cooldown_remaining) > 0.0:
+        return False
+    if ammo_remaining is not None and int(ammo_remaining) <= 0:
+        return False
+    if kind in (WeaponKind.ANTI_AIRCRAFT, WeaponKind.MULTI_ANTI_AIRCRAFT):
+        if not _target_is_aircraft(target):
+            return False
+        phase = _object_value(target, "phase")
+        if phase in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED, "DESTROYED", "IMPACTED"):
+            return False
+    elif kind in (WeaponKind.SNIPER, WeaponKind.PISTOL):
+        if _target_is_aircraft(target):
+            return False
+    elif kind == WeaponKind.RPG:
+        # RPG 只攻擊地面敵人；爆炸範圍由爆炸結算函式判定，不能把
+        # 空中的飛機當成爆炸中心或範圍命中目標。
+        if _target_is_aircraft(target):
+            return False
+    else:
+        return False
+    resolved_distance = distance
+    if resolved_distance is None:
+        position = target_position(target)
+        if position is not None:
+            resolved_distance = vector_length(position)
+    if resolved_distance is not None:
+        limit = max_range
+        if limit is None:
+            limit = {
+                WeaponKind.PISTOL: config.PISTOL_MAX_RANGE,
+                WeaponKind.SNIPER: config.SNIPER_MAX_RANGE,
+                WeaponKind.RPG: config.SNIPER_MAX_RANGE,
+                WeaponKind.ANTI_AIRCRAFT: config.SNIPER_MAX_RANGE,
+                WeaponKind.MULTI_ANTI_AIRCRAFT: config.SNIPER_MAX_RANGE,
+            }[kind]
+        if not 0.0 <= float(resolved_distance) <= float(limit):
+            return False
+    return True
+
+
+def can_fire_weapon(
+    weapon: WeaponKind | str,
+    target: object,
+    *,
+    distance: Optional[float] = None,
+    cooldown_remaining: float = 0.0,
+    ammo_remaining: Optional[int] = None,
+    max_range: Optional[float] = None,
+) -> bool:
+    """`is_valid_target` 的開火語意別名。"""
+
+    return is_valid_target(
+        weapon,
+        target,
+        distance=distance,
+        cooldown_remaining=cooldown_remaining,
+        ammo_remaining=ammo_remaining,
+        max_range=max_range,
+    )
+
+
+def resolve_rpg_targets(
+    center: Vector3,
+    enemies: Mapping[object, object] | Sequence[object],
+    radius: float = 6.0,
+) -> tuple[object, ...]:
+    """在爆炸瞬間建立唯一目標快照，距離內每個 ID 只出現一次。"""
+
+    values = enemies.values() if isinstance(enemies, Mapping) else enemies
+    selected: list[object] = []
+    seen: set[str] = set()
+    limit = max(0.0, float(radius))
+    for enemy in values:
+        if not _target_is_alive(enemy):
+            continue
+        if _target_is_aircraft(enemy):
+            continue
+        identifier = target_identifier(enemy)
+        if identifier is None or identifier in seen:
+            continue
+        position = target_position(enemy)
+        if position is None:
+            continue
+        if vector_length(tuple(value - origin for value, origin in zip(position, center))) <= limit + 1e-6:
+            seen.add(identifier)
+            selected.append(enemy)
+    return tuple(selected)
+
+
+def apply_rpg_explosion(
+    center: Vector3,
+    enemies: Mapping[object, object] | Sequence[object],
+    *,
+    radius: float = 6.0,
+    damage: int = 35,
+    explosion_id: Optional[str] = None,
+    hit_registry: Optional[set[str]] = None,
+) -> tuple[str, ...]:
+    """對爆炸快照中的敵人各套用一次傷害並回傳命中 ID。
+
+    `explosion_id` 可讓碰撞層重送同一個爆炸事件時保持冪等；若呼叫端
+    提供 `hit_registry`，該集合會記錄此爆炸已結算的敵人 ID。可變敵人
+    物件也會留下同一個爆炸的標記，讓沒有集中 registry 的場景適配器仍
+    能拒絕重複回呼。
+    """
+
+    hit_ids: list[str] = []
+    for enemy in resolve_rpg_targets(center, enemies, radius):
+        identifier = target_identifier(enemy)
+        take_damage = getattr(enemy, "take_damage", None)
+        if identifier is None or take_damage is None:
+            continue
+        if explosion_id is not None and not _claim_rpg_hit(
+            enemy,
+            identifier,
+            str(explosion_id),
+            hit_registry,
+        ):
+            continue
+        # 每個 enemy 已由快照去重；即使來源序列重複也只呼叫一次。
+        take_damage(max(0, int(damage)))
+        hit_ids.append(identifier)
+    return tuple(hit_ids)
+
+
+def _claim_rpg_hit(
+    enemy: object,
+    identifier: str,
+    explosion_id: str,
+    hit_registry: Optional[set[str]],
+) -> bool:
+    """宣告一個敵人屬於某次爆炸，避免重送碰撞事件重複扣血。"""
+
+    registry_key = f"{explosion_id}:{identifier}"
+    if hit_registry is not None:
+        if registry_key in hit_registry:
+            return False
+        hit_registry.add(registry_key)
+
+    marker = getattr(enemy, "_rpg_explosion_hits", None)
+    if marker is None:
+        try:
+            marker = set()
+            setattr(enemy, "_rpg_explosion_hits", marker)
+        except (AttributeError, TypeError):
+            # 不可變目標仍可由呼叫端提供 registry；未提供時以本次
+            # resolve 的唯一快照保證不重複。
+            return True
+    try:
+        if explosion_id in marker:
+            if hit_registry is not None:
+                hit_registry.discard(registry_key)
+            return False
+        marker.add(explosion_id)
+    except (AttributeError, TypeError):
+        return True
+    return True
+
+
+# 語意別名：場景層可用「resolve」表達先建立快照再結算的邊界。
+resolve_rpg_explosion = apply_rpg_explosion
+
+
+def select_turret_target(
+    position: Vector3,
+    enemies: Mapping[object, object] | Sequence[object],
+    *,
+    max_range: Optional[float] = None,
+) -> Optional[object]:
+    """選擇距離最近、已落地、非 Boss 的小兵；同距離以穩定 ID 排序。"""
+
+    values = enemies.values() if isinstance(enemies, Mapping) else enemies
+    candidates: list[tuple[float, str, object]] = []
+    limit = None if max_range is None else max(0.0, float(max_range))
+    for enemy in values:
+        if not _target_is_alive(enemy) or _target_is_aircraft(enemy):
+            continue
+        if _target_is_boss(enemy) or not _target_is_landed(enemy):
+            continue
+        identifier = target_identifier(enemy)
+        enemy_position = target_position(enemy)
+        if identifier is None or enemy_position is None:
+            continue
+        distance = vector_length(
+            tuple(value - origin for value, origin in zip(enemy_position, position))
+        )
+        if limit is not None and distance > limit + 1e-6:
+            continue
+        candidates.append((distance, identifier, enemy))
+    return min(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
+
+
+select_auto_defense_target = select_turret_target
+
+
 def try_pickup_weapon(
     current_weapon: Optional[WeaponKind],
     requested_weapon: WeaponKind,
@@ -1056,6 +1477,9 @@ def resolve_session_event(
     event: SessionEvent | str,
     *,
     event_id: Optional[str] = None,
+    slot_id: Optional[int] = None,
+    operation_id: Optional[str] = None,
+    upgrade_id: Optional[str] = None,
     aircraft_id: Optional[str] = None,
     encounter_id: Optional[str] = None,
     wave_plan: Optional[WavePlan] = None,
@@ -1064,6 +1488,9 @@ def resolve_session_event(
     return session.transition(
         event,
         event_id=event_id,
+        slot_id=slot_id,
+        operation_id=operation_id,
+        upgrade_id=upgrade_id,
         aircraft_id=aircraft_id,
         encounter_id=encounter_id,
         wave_plan=wave_plan,
@@ -1139,14 +1566,19 @@ def normalize_aircraft_token(token: str) -> str:
 
 
 class WaveDirector:
-    """Build the finite, deterministic campaign roster."""
+    """建立可依 A 擴充的確定性戰役編隊。
+
+    006 新流程使用 `plan_level`；`plan_wave(int, ...)` 與其固定表是 005
+    純戰鬥 API 的相容適配器，僅供尚未遷移的呼叫端使用，不是 006 遊戲流程
+    的來源。Profile 流程必須傳入 `a-b` 與目前 A。
+    """
 
     _REGULAR_TYPES = (
         AircraftType.NORMAL,
         AircraftType.MANPOWER_SUPPORT,
         AircraftType.FAST,
     )
-    _CAMPAIGN_TOKENS = (
+    _LEGACY_COMPATIBILITY_TOKENS = (
         ("普", "普"),
         ("普", "特"),
         ("特", "特"),
@@ -1172,16 +1604,41 @@ class WaveDirector:
         initial_aircraft_count: int = 2,
         initial_cap: int = 6,
         cap_increment: int = 2,
+        *,
+        progression_config: ProgressionConfig = DEFAULT_CONFIG,
     ) -> None:
         self.initial_aircraft_count = max(1, initial_aircraft_count)
         self.initial_cap = max(self.initial_aircraft_count, initial_cap)
         self.cap_increment = max(1, cap_increment)
+        self.progression_config = progression_config
+
+    def plan_level(
+        self,
+        level_key: LevelKey | str | tuple[int, int],
+        maximum_aircraft_count: int,
+    ) -> LevelPlan:
+        """依目前 A 建立 `a-b` 關卡，不受 4 或 18 的固定上限限制。"""
+
+        return build_level_plan(
+            level_key,
+            maximum_aircraft_count,
+            config=self.progression_config,
+        )
+
+    def plan_a_b(
+        self,
+        level_key: LevelKey | str | tuple[int, int],
+        maximum_aircraft_count: int,
+    ) -> LevelPlan:
+        """`plan_level` 的簡短別名。"""
+
+        return self.plan_level(level_key, maximum_aircraft_count)
 
     def aircraft_count_for_wave(self, wave_number: int) -> int:
         wave_number = int(wave_number)
-        if not 1 <= wave_number <= len(self._CAMPAIGN_TOKENS):
-            raise ValueError("wave_number must be between 1 and 18")
-        return len(self._CAMPAIGN_TOKENS[wave_number - 1])
+        if not 1 <= wave_number <= len(self._LEGACY_COMPATIBILITY_TOKENS):
+            raise ValueError("舊版 wave_number 超出相容範圍")
+        return len(self._LEGACY_COMPATIBILITY_TOKENS[wave_number - 1])
 
     def cap_for_count(self, aircraft_count: int) -> int:
         aircraft_count = max(1, aircraft_count)
@@ -1192,13 +1649,29 @@ class WaveDirector:
 
     def plan_wave(
         self,
-        wave_number: int,
+        wave_number: int | str | LevelKey | tuple[int, int],
         aircraft_count: Optional[int] = None,
         cap: Optional[int] = None,
-    ) -> WavePlan:
+        *,
+        maximum_aircraft_count: Optional[int] = None,
+    ) -> WavePlan | LevelPlan:
+        # 006 的 a-b 入口不建立舊版固定表；保留整數形式只為讓既有
+        # 場景適配器可以在遷移期間繼續工作。
+        if isinstance(wave_number, (LevelKey, tuple)) or (
+            isinstance(wave_number, str) and "-" in wave_number
+        ):
+            if aircraft_count is not None or cap is not None:
+                raise ValueError("a-b 關卡不可搭配舊式 aircraft_count/cap 覆寫")
+            key = LevelKey.parse(wave_number)
+            maximum = (
+                max(2, key.a)
+                if maximum_aircraft_count is None
+                else int(maximum_aircraft_count)
+            )
+            return self.plan_level(key, maximum)
         wave_number = int(wave_number)
-        if not 1 <= wave_number <= len(self._CAMPAIGN_TOKENS):
-            raise ValueError("wave_number must be between 1 and 18")
+        if not 1 <= wave_number <= len(self._LEGACY_COMPATIBILITY_TOKENS):
+            raise ValueError("舊版 wave_number 超出相容範圍")
         has_synthetic_override = aircraft_count is not None or cap is not None
         if has_synthetic_override:
             count = (
@@ -1238,17 +1711,25 @@ class WaveDirector:
                 is_boss_wave=progress.is_boss_wave,
                 roster=progress.roster,
             )
-        if progress.wave_number >= len(self._CAMPAIGN_TOKENS):
-            raise ValueError("wave 18 has no successor")
+        if progress.wave_number >= len(self._LEGACY_COMPATIBILITY_TOKENS):
+            raise ValueError("舊版戰役沒有下一個相容波次")
         return self.plan_wave(progress.wave_number + 1).to_progress()
 
     def is_final_wave(self, wave_number: int) -> bool:
-        return int(wave_number) == len(self._CAMPAIGN_TOKENS)
+        return int(wave_number) == len(self._LEGACY_COMPATIBILITY_TOKENS)
+
+    @staticmethod
+    def is_final_level(
+        level_key: LevelKey | str | tuple[int, int],
+        maximum_aircraft_count: int,
+    ) -> bool:
+        key = LevelKey.parse(level_key)
+        return key.a == int(maximum_aircraft_count) and key.b == 2 * int(maximum_aircraft_count) + 1
 
     @classmethod
     def _campaign_roster(cls, wave_number: int) -> tuple[AircraftType, ...]:
         special_ordinal = 0
-        for index, raw_roster in enumerate(cls._CAMPAIGN_TOKENS, start=1):
+        for index, raw_roster in enumerate(cls._LEGACY_COMPATIBILITY_TOKENS, start=1):
             resolved: list[AircraftType] = []
             for raw_token in raw_roster:
                 token = normalize_aircraft_token(raw_token)
@@ -1267,7 +1748,7 @@ class WaveDirector:
                     raise ValueError(f"Unknown campaign token: {raw_token}")
             if index == wave_number:
                 return tuple(resolved)
-        raise ValueError("wave_number must be between 1 and 18")
+        raise ValueError("舊版 wave_number 超出相容範圍")
 
 
 class EncounterFactory:

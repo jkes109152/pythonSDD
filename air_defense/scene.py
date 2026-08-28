@@ -16,7 +16,14 @@ from ursina import Entity, Vec3, camera, color, destroy, raycast, scene as ursin
 from ursina.prefabs.first_person_controller import FirstPersonController
 
 from . import config
-from .entities import Aircraft, CrewMember, GroundEncounter, GroundTracerEffect, GuidedMissile
+from .entities import (
+    Aircraft,
+    AutoDefenseTurret,
+    CrewMember,
+    GroundEncounter,
+    GroundTracerEffect,
+    GuidedMissile,
+)
 from .rules import (
     aircraft_profile,
     apply_aim_assist,
@@ -43,6 +50,7 @@ class WorldHandles:
     sniper_pickup: Entity
     cover_nodes: dict[str, Entity]
     obstacles: tuple[Entity, ...] = ()
+    turret_positions: tuple[tuple[float, float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -80,6 +88,8 @@ class AirDefenseScene:
         self._effects: list[tuple[Entity, float]] = []
         self.tracer_entities: dict[str, Entity] = {}
         self.tracer_effects: dict[str, GroundTracerEffect] = {}
+        self.turret_entities: dict[str, Entity] = {}
+        self.multi_lock_entities: dict[str, Entity] = {}
         self._last_aircraft_targets: dict[str, AircraftScreenTarget] = {}
 
     def create_optional_model(
@@ -229,6 +239,7 @@ class AirDefenseScene:
             sniper_pickup=sniper_pickup,
             cover_nodes=cover_nodes,
             obstacles=tuple(obstacles),
+            turret_positions=tuple(config.AUTO_DEFENSE_TURRET_POSITIONS),
         )
         self._create_player()
         return self.world
@@ -288,6 +299,12 @@ class AirDefenseScene:
         for entity in self.missile_entities.values():
             destroy(entity)
         self.missile_entities.clear()
+        for entity in getattr(self, "turret_entities", {}).values():
+            destroy(entity)
+        getattr(self, "turret_entities", {}).clear()
+        for entity in getattr(self, "multi_lock_entities", {}).values():
+            destroy(entity)
+        getattr(self, "multi_lock_entities", {}).clear()
         if clear_effects:
             for entity, _ in self._effects:
                 destroy(entity)
@@ -420,6 +437,8 @@ class AirDefenseScene:
     def project_aircraft_target(
         self,
         aircraft_entity: Optional[Entity] = None,
+        *,
+        lock_frame_size: float = config.AA_LOCK_FRAME_SIZE,
     ) -> Optional[AircraftScreenTarget]:
         """Project one target; the scalar wrapper remains for old callers."""
 
@@ -444,6 +463,7 @@ class AirDefenseScene:
                 screen_position,
                 viewport_width,
                 viewport_height,
+                frame_size=max(0.0, float(lock_frame_size)),
             )
             target = AircraftScreenTarget(
                 visible=visible,
@@ -458,6 +478,7 @@ class AirDefenseScene:
                     screen_position,
                     viewport_width,
                     viewport_height,
+                    frame_size=max(0.0, float(lock_frame_size)),
                 ),
             )
             target_id = target.aircraft_id
@@ -470,13 +491,18 @@ class AirDefenseScene:
     def project_aircraft_targets(
         self,
         aircraft_entities: Optional[dict[str, Entity]] = None,
+        *,
+        lock_frame_size: float = config.AA_LOCK_FRAME_SIZE,
     ) -> dict[str, AircraftScreenTarget]:
         """Project every keyed aircraft in stable ID order."""
 
         entities = aircraft_entities if aircraft_entities is not None else self.aircraft_entities
         projections: dict[str, AircraftScreenTarget] = {}
         for aircraft_id in sorted(entities):
-            target = self.project_aircraft_target(entities[aircraft_id])
+            target = self.project_aircraft_target(
+                entities[aircraft_id],
+                lock_frame_size=lock_frame_size,
+            )
             if target is not None:
                 projections[aircraft_id] = target
             elif aircraft_id in self._last_aircraft_targets:
@@ -798,6 +824,106 @@ class AirDefenseScene:
     def clear_ground_tracers(self) -> None:
         for tracer_id in tuple(self.tracer_entities):
             self._remove_ground_tracer(tracer_id)
+
+    def create_auto_defense_turrets(
+        self,
+        turrets: Iterable[AutoDefenseTurret],
+    ) -> dict[str, Entity]:
+        """依固定座標建立目前小關的砲塔，最多六台。"""
+
+        if self.world is None:
+            return {}
+        self.clear_auto_defense_turrets()
+        fixed_positions = tuple(self.world.turret_positions) or tuple(
+            config.AUTO_DEFENSE_TURRET_POSITIONS
+        )
+        for index, turret in enumerate(tuple(turrets)[: config.MAX_AUTO_DEFENSE_TURRETS]):
+            if index >= len(fixed_positions):
+                break
+            position = fixed_positions[index]
+            turret.position = tuple(position)
+            entity = Entity(
+                model="cube",
+                position=Vec3(*position) + Vec3(0, 0.65, 0),
+                scale=(1.1, 1.3, 1.1),
+                color=_rgb((0.28, 0.42, 0.48)),
+                collider="box",
+            )
+            entity.turret_id = turret.id
+            entity.turret_position_id = index
+            self.turret_entities[turret.id] = entity
+            self._dynamic_entities.append(entity)
+        return dict(self.turret_entities)
+
+    # Compatibility aliases used by controller and headless scene fixtures.
+    create_turrets = create_auto_defense_turrets
+
+    def update_auto_defense_turrets(
+        self,
+        turrets: Iterable[AutoDefenseTurret],
+    ) -> None:
+        for turret in turrets:
+            entity = self.turret_entities.get(turret.id)
+            if entity is None:
+                continue
+            entity.enabled = bool(turret.enabled)
+            entity.turret_target_id = turret.target_id
+
+    update_turrets = update_auto_defense_turrets
+
+    def clear_auto_defense_turrets(self) -> None:
+        for turret_id, entity in tuple(self.turret_entities.items()):
+            self._forget_dynamic_entity_refs(entity)
+            destroy(entity)
+            self.turret_entities.pop(turret_id, None)
+
+    clear_turrets = clear_auto_defense_turrets
+
+    def create_rpg_explosion(
+        self,
+        center: tuple[float, float, float],
+        radius: float = config.RPG_EXPLOSION_RADIUS,
+    ) -> Optional[Entity]:
+        """建立短暫 RPG 爆炸效果；命中結算仍由純規則層負責。"""
+
+        try:
+            explosion = Entity(
+                model="sphere",
+                position=Vec3(*center),
+                scale=max(0.1, float(radius) * 0.35),
+                color=_rgb(config.ORANGE_RGB),
+            )
+        except Exception:
+            return None
+        self._effects.append((explosion, config.GUIDED_MISSILE_EXPLOSION_SECONDS))
+        return explosion
+
+    def update_multi_target_locks(
+        self,
+        target_positions: dict[str, tuple[float, float, float]],
+    ) -> dict[str, Entity]:
+        """顯示多目標鎖定投影的輕量標記。"""
+
+        for target_id, entity in tuple(self.multi_lock_entities.items()):
+            if target_id not in target_positions:
+                self._forget_dynamic_entity_refs(entity)
+                destroy(entity)
+                self.multi_lock_entities.pop(target_id, None)
+        for target_id, position in target_positions.items():
+            entity = self.multi_lock_entities.get(str(target_id))
+            if entity is None:
+                entity = Entity(
+                    model="sphere",
+                    position=Vec3(*position),
+                    scale=0.18,
+                    color=_rgb(config.GREEN_RGB),
+                )
+                entity.lock_target_id = str(target_id)
+                self.multi_lock_entities[str(target_id)] = entity
+                self._dynamic_entities.append(entity)
+            else:
+                entity.position = Vec3(*position)
+        return dict(self.multi_lock_entities)
 
     def move_weapon_pickup(
         self,
