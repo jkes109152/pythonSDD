@@ -28,9 +28,11 @@ AIRSTRIKE_WARNING_LEAD_SECONDS = 8.0
 CREW_ADVANCE_INTERVAL_SECONDS = 2.0
 AIRCRAFT_FORMATION_HORIZONTAL_SPACING = 10.0
 
-# Fixed campaign and aircraft-drop tuning.  Keep these values in the shared
-# configuration so the domain, scene adapter and controller use one contract.
-CAMPAIGN_WAVE_COUNT = 18
+# 005 舊版純戰鬥 API 的相容邊界。006 Profile 流程不讀取此值；其戰役上限
+# 由 progression.ProgressionConfig.maximum_aircraft_count() 推導，絕不以 18
+# 限制 A 或 a-b 關卡。保留這個命名明確的相容常數，讓既有 005 測試與外部
+# 呼叫端能在遷移期間繼續使用舊 WaveDirector／GameSession API。
+LEGACY_COMPATIBILITY_WAVE_COUNT = 18
 CREW_DESCENT_DURATION_SECONDS = 4.0
 CREW_DESCENT_TOLERANCE_SECONDS = 0.25
 GROUND_LEVEL_Y = 0.0
@@ -76,9 +78,25 @@ HUD_CD_GAP = 0.018
 AA_FIRE_COOLDOWN_SECONDS = 1.25
 SNIPER_FIRE_COOLDOWN_SECONDS = 0.75
 PISTOL_FIRE_COOLDOWN_SECONDS = 0.20
+RPG_FIRE_COOLDOWN_SECONDS = 2.5
+RPG_AMMO_PER_SUBLEVEL = 3
+RPG_EXPLOSION_RADIUS = 6.0
+RPG_DAMAGE = 35
 PISTOL_MAX_RANGE = 12.0
 SNIPER_MAX_RANGE = 180.0
 CREW_ATTACK_COOLDOWN_SECONDS = 1.5
+
+# 006 的自動防禦只使用固定位置，容量與彈藥規則由 progression.py
+# 集中管理；這裡只保存場景座標與顯示／更新所需的幾何資料。
+AUTO_DEFENSE_TURRET_POSITIONS = (
+    (-24.0, 0.0, 64.0),
+    (-8.0, 0.0, 56.0),
+    (9.0, 0.0, 50.0),
+    (24.0, 0.0, 36.0),
+    (-20.0, 0.0, 8.0),
+    (18.0, 0.0, -18.0),
+)
+MAX_AUTO_DEFENSE_TURRETS = 6
 
 PLAYER_MAX_HEALTH = 100
 CREW_DAMAGE = 8

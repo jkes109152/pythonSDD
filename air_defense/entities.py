@@ -126,6 +126,124 @@ class Pistol(WeaponPickup):
 
 
 @dataclass
+class RPGWeapon(WeaponPickup):
+    """本局 RPG；彈藥與冷卻在每個小關重新建立。"""
+
+    kind: WeaponKind = field(default=WeaponKind.RPG, init=False)
+    ammo_remaining: int = 3
+    fire_cooldown: float = 0.0
+    explosion_radius: float = 6.0
+    damage: int = 35
+    last_explosion_id: Optional[str] = None
+    explosion_hit_ids: set[str] = field(default_factory=set, repr=False)
+
+    def update_cooldown(self, delta_seconds: float) -> None:
+        self.fire_cooldown = max(0.0, self.fire_cooldown - max(0.0, float(delta_seconds)))
+
+    def can_fire(self) -> bool:
+        return self.ammo_remaining > 0 and self.fire_cooldown <= 0.0
+
+    def mark_fired(self, explosion_id: Optional[str] = None) -> bool:
+        if not self.can_fire():
+            return False
+        self.ammo_remaining -= 1
+        self.fire_cooldown = config.RPG_FIRE_COOLDOWN_SECONDS
+        self.last_explosion_id = (
+            str(explosion_id) if explosion_id is not None else None
+        )
+        self.explosion_hit_ids.clear()
+        return True
+
+
+RPG = RPGWeapon
+RPGLauncher = RPGWeapon
+
+
+@dataclass
+class MultiAntiAircraftGun(AntiAircraftGun):
+    """多目標防空炮的場景資料；鎖定進度由規則層追蹤器管理。"""
+
+    kind: WeaponKind = field(default=WeaponKind.MULTI_ANTI_AIRCRAFT, init=False)
+    target_aircraft_ids: list[str] = field(default_factory=list)
+    target_capacity: int = 2
+    volley_id: Optional[str] = None
+
+    def set_targets(self, target_ids: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+        self.target_aircraft_ids = []
+        for target_id in target_ids:
+            value = str(target_id)
+            if value not in self.target_aircraft_ids:
+                self.target_aircraft_ids.append(value)
+            if len(self.target_aircraft_ids) >= max(0, int(self.target_capacity)):
+                break
+        return tuple(self.target_aircraft_ids)
+
+    def mark_fired(self) -> None:
+        self.fire_cooldown = config.AA_FIRE_COOLDOWN_SECONDS
+        self.volley_id = None
+        self.target_aircraft_ids.clear()
+        self.lock_state = LockState.WHITE
+        self.lock_elapsed = 0.0
+
+
+# Public name used by the progression specification and by scene adapters.
+MultiTargetAntiAircraftGun = MultiAntiAircraftGun
+
+
+@dataclass
+class AutoDefenseTurret:
+    """固定位置、有限彈藥的陸地自動防禦系統。"""
+
+    id: str
+    position: tuple[float, float, float]
+    enabled: bool = True
+    target_id: Optional[str] = None
+    ammo_remaining: int = 20
+    cooldown_remaining: float = 0.0
+    damage: int = 20
+    cooldown_seconds: float = 1.5
+
+    def __post_init__(self) -> None:
+        self.id = str(self.id)
+        self.position = tuple(float(value) for value in self.position)
+        self.ammo_remaining = max(0, int(self.ammo_remaining))
+        self.cooldown_remaining = max(0.0, float(self.cooldown_remaining))
+        self.damage = max(0, int(self.damage))
+        self.cooldown_seconds = max(0.0, float(self.cooldown_seconds))
+
+    @property
+    def can_fire(self) -> bool:
+        return bool(
+            self.enabled
+            and self.target_id is not None
+            and self.ammo_remaining > 0
+            and self.cooldown_remaining <= 0.0
+        )
+
+    def update(self, delta_seconds: float) -> None:
+        self.cooldown_remaining = max(
+            0.0, self.cooldown_remaining - max(0.0, float(delta_seconds))
+        )
+
+    def assign_target(self, target_id: Optional[str]) -> None:
+        self.target_id = str(target_id) if target_id is not None else None
+
+    def release_target(self) -> None:
+        self.target_id = None
+
+    def mark_fired(self) -> bool:
+        if not self.can_fire:
+            return False
+        self.ammo_remaining -= 1
+        self.cooldown_remaining = self.cooldown_seconds
+        return True
+
+
+LandAutoDefenseSystem = AutoDefenseTurret
+AutoDefenseTurretState = AutoDefenseTurret
+
+
+@dataclass
 class TargetBuilding:
     id: str = "target-building"
     position: tuple[float, float, float] = config.BUILDING_POSITION
