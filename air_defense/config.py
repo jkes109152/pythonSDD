@@ -17,6 +17,7 @@ AA_LOCK_DECAY_SECONDS = 0.75
 # The white anti-air frame is deliberately twice the legacy 0.105 size.
 AA_LOCK_FRAME_LEGACY_SIZE = 0.105
 AA_LOCK_FRAME_SIZE = AA_LOCK_FRAME_LEGACY_SIZE * 2.0
+AA_MULTI_LOCK_FRAME_MULTIPLIER = 2.0
 AA_LOCK_RING_ACQUISITION_RADIUS = 0.105
 AA_LOCK_RING_PADDING = 0.012
 AA_LOCK_PROGRESS_BAR_WIDTH = 0.24
@@ -84,6 +85,11 @@ RPG_EXPLOSION_RADIUS = 6.0
 RPG_DAMAGE = 35
 PISTOL_MAX_RANGE = 12.0
 SNIPER_MAX_RANGE = 180.0
+# Ground auto-defense deliberately uses the player's unupgraded pistol cadence.
+AUTO_DEFENSE_FIRE_COOLDOWN_SECONDS = PISTOL_FIRE_COOLDOWN_SECONDS
+AUTO_DEFENSE_MAX_RANGE = 32.0
+AUTO_DEFENSE_BOSS_DAMAGE_FLOOR_RATIO = 0.50
+AUTO_DEFENSE_DAMAGE = 1
 CREW_ATTACK_COOLDOWN_SECONDS = 1.5
 
 # 006 的自動防禦只使用固定位置，容量與彈藥規則由 progression.py
@@ -107,6 +113,7 @@ ENCOUNTER_MIN_CREW = 0
 ENCOUNTER_MAX_CREW = 3
 MANPOWER_SUPPORT_CREW = 6
 ARMORED_AIRCRAFT_HEALTH = 5
+GROUND_MINION_HEALTH = 3
 GROUND_BOSS_HEALTH = 10
 GROUND_MOVE_SPEED = 4.0
 GROUND_BOSS_MOVE_SPEED = 2.5
@@ -147,6 +154,13 @@ GUIDED_MISSILE_WIDTH = 0.16
 GUIDED_MISSILE_HEIGHT = 0.16
 GUIDED_MISSILE_EXPLOSION_SECONDS = 0.45
 
+# RPG projectile is visual feedback only; the RPG explosion still resolves
+# immediately through the pure rules path after a valid shot.
+RPG_PROJECTILE_LIFETIME_SECONDS = 0.18
+RPG_PROJECTILE_LENGTH = 0.90
+RPG_PROJECTILE_WIDTH = 0.16
+RPG_PROJECTILE_HEIGHT = 0.16
+
 # Ground attack feedback is visual only; it never owns collision or damage.
 GROUND_TRACER_LIFETIME_SECONDS = 0.18
 GROUND_TRACER_TAIL_LENGTH = 2.2
@@ -161,6 +175,17 @@ DEFENSE_POINT_POSITION = (-18.0, 0.0, 70.0)
 WEAPON_RACK_POSITION = (-18.0, 1.0, 66.0)
 CRASH_SITE_POSITION = (0.0, 0.0, 90.0)
 CITY_ATTACK_POINT = (0.0, 0.0, -45.0)
+
+# Scene presentation.  The directional light is intentionally warm and
+# angled so aircraft, people and the building show a readable sun-facing
+# highlight plus a cast shadow on the ground.  The bounds cover the complete
+# route and normal flight corridor instead of only the currently spawned wave.
+SUN_DIRECTION = (-1.0, -1.15, -0.75)
+SUN_RGB = (1.0, 0.93, 0.78)
+AMBIENT_RGB = (0.16, 0.19, 0.25)
+SUN_SHADOW_MAP_RESOLUTION = (1024, 1024)
+SUN_SHADOW_BOUNDS_CENTER = (0.0, 50.0, 40.0)
+SUN_SHADOW_BOUNDS_SCALE = (MAP_WIDTH + 24.0, 100.0, MAP_LENGTH + 160.0)
 
 # Retain the old scalar name for callers that only need a square-ish fallback,
 # while the scene uses the explicit rectangular dimensions above.

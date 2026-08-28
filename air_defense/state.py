@@ -58,6 +58,13 @@ class LockState(str, Enum):
     GREEN_READY = "GREEN_READY"
 
 
+class AntiAirGuiMode(str, Enum):
+    """主選單可選的防空瞄準介面；只影響 HUD，不改變規則。"""
+
+    NEW = "NEW"
+    LEGACY = "LEGACY"
+
+
 class FailureReason(str, Enum):
     BUILDING_IMPACT = "BUILDING_IMPACT"
     PLAYER_DEAD = "PLAYER_DEAD"
@@ -685,7 +692,6 @@ class GameSession:
                 AutoDefenseTurret(
                     id=f"turret-{index + 1:02d}",
                     position=position,
-                    ammo_remaining=self.progression_config.auto_defense_ammo_per_sublevel,
                     cooldown_seconds=effective_cooldown(
                         self.progression_config.auto_defense_cooldown_seconds,
                         self.profile,
@@ -1095,7 +1101,7 @@ class GameSession:
                     profile,
                     config=self.progression_config,
                 ),
-                range=SNIPER_MAX_RANGE,
+                range=PISTOL_MAX_RANGE,
                 damage=self.progression_config.rpg_damage,
             ),
             WeaponKind.MULTI_ANTI_AIRCRAFT: WeaponRuntime(

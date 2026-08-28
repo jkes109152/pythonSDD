@@ -169,18 +169,18 @@ class MultiAntiAircraftGun(AntiAircraftGun):
     volley_id: Optional[str] = None
 
     def set_targets(self, target_ids: list[str] | tuple[str, ...]) -> tuple[str, ...]:
+        """Store the current target IDs without consulting legacy capacity."""
+
         self.target_aircraft_ids = []
         for target_id in target_ids:
             value = str(target_id)
             if value not in self.target_aircraft_ids:
                 self.target_aircraft_ids.append(value)
-            if len(self.target_aircraft_ids) >= max(0, int(self.target_capacity)):
-                break
         return tuple(self.target_aircraft_ids)
 
-    def mark_fired(self) -> None:
+    def mark_fired(self, volley_id: Optional[str] = None) -> None:
         self.fire_cooldown = config.AA_FIRE_COOLDOWN_SECONDS
-        self.volley_id = None
+        self.volley_id = str(volley_id) if volley_id is not None else None
         self.target_aircraft_ids.clear()
         self.lock_state = LockState.WHITE
         self.lock_elapsed = 0.0
@@ -192,31 +192,37 @@ MultiTargetAntiAircraftGun = MultiAntiAircraftGun
 
 @dataclass
 class AutoDefenseTurret:
-    """固定位置、有限彈藥的陸地自動防禦系統。"""
+    """固定位置、無限彈藥的陸地自動防禦系統。"""
 
     id: str
     position: tuple[float, float, float]
     enabled: bool = True
     target_id: Optional[str] = None
-    ammo_remaining: int = 20
+    # Retained as a compatibility field for older callers/save snapshots.  The
+    # current land-defense rules deliberately do not use a finite ammo pool.
+    ammo_remaining: Optional[int] = None
     cooldown_remaining: float = 0.0
-    damage: int = 20
-    cooldown_seconds: float = 1.5
+    damage: int = config.AUTO_DEFENSE_DAMAGE
+    cooldown_seconds: float = config.AUTO_DEFENSE_FIRE_COOLDOWN_SECONDS
+    shot_sequence: int = 0
 
     def __post_init__(self) -> None:
         self.id = str(self.id)
         self.position = tuple(float(value) for value in self.position)
-        self.ammo_remaining = max(0, int(self.ammo_remaining))
+        # Do not let a legacy ammo value turn the current turret into a finite
+        # resource.  Keeping the field as ``None`` makes the unlimited policy
+        # explicit to adapters that still inspect it.
+        self.ammo_remaining = None
         self.cooldown_remaining = max(0.0, float(self.cooldown_remaining))
         self.damage = max(0, int(self.damage))
         self.cooldown_seconds = max(0.0, float(self.cooldown_seconds))
+        self.shot_sequence = max(0, int(self.shot_sequence))
 
     @property
     def can_fire(self) -> bool:
         return bool(
             self.enabled
             and self.target_id is not None
-            and self.ammo_remaining > 0
             and self.cooldown_remaining <= 0.0
         )
 
@@ -234,8 +240,8 @@ class AutoDefenseTurret:
     def mark_fired(self) -> bool:
         if not self.can_fire:
             return False
-        self.ammo_remaining -= 1
         self.cooldown_remaining = self.cooldown_seconds
+        self.shot_sequence += 1
         return True
 
 
@@ -551,6 +557,76 @@ class GroundTracerEffect:
 
 
 @dataclass
+class RPGProjectileEffect:
+    """Short-lived green cuboid feedback for one valid RPG shot.
+
+    This object deliberately owns no collision or damage.  RPG damage is
+    resolved once by ``apply_rpg_explosion``; the scene adapter only animates
+    this effect from the player's view toward the already selected center.
+    """
+
+    id: str
+    start_position: tuple[float, float, float]
+    target_position: tuple[float, float, float]
+    remaining_seconds: float = config.RPG_PROJECTILE_LIFETIME_SECONDS
+    lifetime_seconds: float = config.RPG_PROJECTILE_LIFETIME_SECONDS
+    travel_progress: float = 0.0
+    length: float = config.RPG_PROJECTILE_LENGTH
+    width: float = config.RPG_PROJECTILE_WIDTH
+    height: float = config.RPG_PROJECTILE_HEIGHT
+    visual_color: tuple[float, float, float] = config.GREEN_RGB
+    expired: bool = False
+
+    def __post_init__(self) -> None:
+        self.id = str(self.id)
+        self.start_position = tuple(float(value) for value in self.start_position)
+        self.target_position = tuple(float(value) for value in self.target_position)
+        self.lifetime_seconds = max(1e-6, float(self.lifetime_seconds))
+        self.remaining_seconds = max(
+            0.0,
+            min(self.lifetime_seconds, float(self.remaining_seconds)),
+        )
+        self.travel_progress = max(0.0, min(1.0, float(self.travel_progress)))
+        self.length = max(0.001, float(self.length))
+        self.width = max(0.001, float(self.width))
+        self.height = max(0.001, float(self.height))
+        self.visual_color = tuple(float(value) for value in self.visual_color)  # type: ignore[assignment]
+        self.expired = bool(self.expired or self.remaining_seconds <= 0.0)
+
+    @property
+    def head_position(self) -> tuple[float, float, float]:
+        return tuple(
+            self.start_position[index]
+            + (self.target_position[index] - self.start_position[index]) * self.travel_progress
+            for index in range(3)
+        )
+
+    @property
+    def tail_position(self) -> tuple[float, float, float]:
+        head = self.head_position
+        direction = normalize_vector(
+            tuple(
+                self.target_position[index] - self.start_position[index]
+                for index in range(3)
+            )
+        )
+        return tuple(head[index] - direction[index] * self.length for index in range(3))
+
+    def advance(self, delta_seconds: float) -> bool:
+        """Advance the visual projectile and report whether it expired."""
+
+        if self.expired:
+            return True
+        delta_seconds = max(0.0, float(delta_seconds))
+        elapsed = self.lifetime_seconds - self.remaining_seconds
+        elapsed = min(self.lifetime_seconds, elapsed + delta_seconds)
+        self.remaining_seconds = max(0.0, self.lifetime_seconds - elapsed)
+        self.travel_progress = min(1.0, elapsed / self.lifetime_seconds)
+        self.expired = self.travel_progress >= 1.0 or self.remaining_seconds <= 0.0
+        return self.expired
+
+
+@dataclass
 class BatchProgress:
     """Mutable source-scoped counters owned by one ground encounter."""
 
@@ -590,6 +666,8 @@ class CrewMember:
     target_cover_node: Optional[str] = None
     route_index: int = 0
     move_speed: float = config.GROUND_MOVE_SPEED
+    # Keep the low-level constructor's legacy one-hit default.  New gameplay
+    # encounters explicitly use GROUND_MINION_HEALTH through EncounterFactory.
     health: int = 1
     max_health: int = 1
     is_boss: bool = False

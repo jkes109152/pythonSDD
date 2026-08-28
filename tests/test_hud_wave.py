@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from air_defense import config
 from air_defense.hud import GameHUD
@@ -20,6 +21,7 @@ from air_defense.entities import (
 from air_defense.rules import (
     EncounterFactory,
     LockOnTracker,
+    MultiLockView,
     WaveDirector,
     build_city_status_view,
     build_player_status_view,
@@ -34,6 +36,7 @@ from air_defense.rules import (
     weapon_cooldown_view,
 )
 from air_defense.state import (
+    AntiAirGuiMode,
     AircraftPhase,
     AircraftType,
     GamePhase,
@@ -280,6 +283,7 @@ class VictoryHudFixtureTests(unittest.TestCase):
         hud.lock_reticle = SimpleNamespace(enabled=False)
         hud.sniper_crosshair = SimpleNamespace(enabled=False)
         hud.pistol_reticle = SimpleNamespace(enabled=False)
+        hud.rpg_reticle = SimpleNamespace(enabled=False)
         hud.scope_overlay = SimpleNamespace(enabled=False)
 
         hud.update_reticle(WeaponKind.SNIPER, GamePhase.HYBRID_COMBAT)
@@ -291,6 +295,160 @@ class VictoryHudFixtureTests(unittest.TestCase):
         self.assertTrue(hud.lock_frame.enabled)
         self.assertTrue(hud.lock_label.enabled)
         self.assertFalse(hud.sniper_crosshair.enabled)
+
+        hud.update_reticle(WeaponKind.PISTOL, GamePhase.GROUND_COMBAT)
+        self.assertTrue(hud.pistol_reticle.enabled)
+        self.assertFalse(hud.rpg_reticle.enabled)
+        hud.update_reticle(WeaponKind.RPG, GamePhase.GROUND_COMBAT)
+        self.assertTrue(hud.rpg_reticle.enabled)
+        self.assertFalse(hud.pistol_reticle.enabled)
+        self.assertFalse(hud.sniper_crosshair.enabled)
+        self.assertFalse(hud.lock_frame.enabled)
+
+    def test_legacy_anti_air_mode_restores_original_frame_and_follow_ring(self) -> None:
+        hud = GameHUD.__new__(GameHUD)
+        hud.lock_frame = SimpleNamespace(enabled=False, scale=0.0)
+        hud.lock_ring = SimpleNamespace(enabled=False, scale=0.0)
+        hud.lock_label = SimpleNamespace(enabled=False)
+        hud.lock_reticle = SimpleNamespace(enabled=False)
+        hud.sniper_crosshair = SimpleNamespace(enabled=False)
+        hud.pistol_reticle = SimpleNamespace(enabled=False)
+        hud.rpg_reticle = SimpleNamespace(enabled=False)
+        hud.scope_overlay = SimpleNamespace(enabled=False)
+
+        hud.update_reticle(
+            WeaponKind.ANTI_AIRCRAFT,
+            GamePhase.AIRSTRIKE,
+            anti_air_scope_enabled=True,
+            anti_air_gui_mode=AntiAirGuiMode.LEGACY,
+        )
+        self.assertTrue(hud.lock_frame.enabled)
+        self.assertFalse(hud.lock_ring.enabled)
+        self.assertFalse(hud.lock_reticle.enabled)
+
+        hud.lock_frame.children = []
+        hud.lock_reticle.children = []
+        hud.lock_ring.position = None
+        hud.lock_ring.color = None
+        hud.lock_label.text = ""
+        hud.lock_label.color = None
+        hud.lock_percent_text = SimpleNamespace(enabled=False, text="", color=None)
+        hud.lock_bar_background = SimpleNamespace(enabled=False)
+        hud.lock_bar_fill = SimpleNamespace(enabled=False, scale_x=0.0, color=None)
+        hud.update_lock(
+            LockState.RED_TRACKING,
+            True,
+            active=True,
+            progress=0.0,
+            target_position=(0.1, 0.2),
+            target_radius=0.02,
+            anti_air_gui_mode=AntiAirGuiMode.LEGACY,
+        )
+        acquisition_scale = hud.lock_ring.scale[0]
+        self.assertTrue(hud.lock_frame.enabled)
+        self.assertTrue(hud.lock_ring.enabled)
+        self.assertFalse(hud.lock_reticle.enabled)
+        hud.update_lock(
+            LockState.GREEN_READY,
+            True,
+            active=True,
+            progress=1.0,
+            target_position=(0.1, 0.2),
+            target_radius=0.02,
+            anti_air_gui_mode=AntiAirGuiMode.LEGACY,
+        )
+        self.assertLess(hud.lock_ring.scale[0], acquisition_scale)
+        self.assertEqual(hud.lock_ring.position, (0.1, 0.2))
+
+        hud.update_reticle(
+            WeaponKind.MULTI_ANTI_AIRCRAFT,
+            GamePhase.AIRSTRIKE,
+            anti_air_scope_enabled=True,
+            anti_air_gui_mode=AntiAirGuiMode.LEGACY,
+        )
+        self.assertTrue(hud.lock_frame.enabled)
+        self.assertFalse(hud.lock_ring.enabled)
+        self.assertTrue(hud.lock_reticle.enabled)
+
+        hud.update_reticle(
+            WeaponKind.ANTI_AIRCRAFT,
+            GamePhase.AIRSTRIKE,
+            anti_air_scope_enabled=True,
+            anti_air_gui_mode=AntiAirGuiMode.NEW,
+        )
+        self.assertTrue(hud.lock_frame.enabled)
+        self.assertFalse(hud.lock_ring.enabled)
+        self.assertTrue(hud.lock_reticle.enabled)
+
+    def test_settings_mode_text_has_new_and_legacy_choices(self) -> None:
+        hud = GameHUD.__new__(GameHUD)
+        hud.settings_mode_text = SimpleNamespace(text="")
+        hud.settings_new_button = SimpleNamespace(color=None)
+        hud.settings_legacy_button = SimpleNamespace(color=None)
+
+        hud.update_settings_mode(AntiAirGuiMode.LEGACY)
+        self.assertIn("舊版", hud.settings_mode_text.text)
+        hud.update_settings_mode(AntiAirGuiMode.NEW)
+        self.assertIn("新版", hud.settings_mode_text.text)
+
+    def test_multi_lock_hud_pool_supports_ten_targets_and_releases_stale_ids(self) -> None:
+        hud = GameHUD.__new__(GameHUD)
+        hud.gameplay_root = SimpleNamespace()
+        hud.multi_reticle_pool = {}
+        hud.lock_frame = SimpleNamespace(children=[])
+        views = tuple(
+            MultiLockView(
+                target_id=f"aircraft-{index:02d}",
+                screen_position=(float(index) / 100.0, 0.0),
+                progress=0.5,
+                state=LockState.RED_TRACKING,
+                visible=True,
+                fireable=False,
+            )
+            for index in range(12)
+        )
+
+        def make_reticle(_parent, _size):
+            return SimpleNamespace(enabled=False, children=[], color=None)
+
+        with patch.object(GameHUD, "_make_crosshair", side_effect=make_reticle):
+            hud.update_multi_lock_views(views)
+            self.assertEqual(set(hud.multi_reticle_pool), {view.target_id for view in views})
+            hud.update_multi_lock_views(views[:2])
+
+        self.assertEqual(set(hud.multi_reticle_pool), {"aircraft-00", "aircraft-01"})
+
+    def test_whitebox_upgrade_scale_is_shared_and_multi_frame_is_doubled(self) -> None:
+        hud = GameHUD.__new__(GameHUD)
+        hud.lock_frame = SimpleNamespace(enabled=False, scale=0.0)
+        hud.lock_label = SimpleNamespace(enabled=False)
+        hud.lock_reticle = SimpleNamespace(enabled=False)
+        hud.sniper_crosshair = SimpleNamespace(enabled=False)
+        hud.pistol_reticle = SimpleNamespace(enabled=False)
+        hud.rpg_reticle = SimpleNamespace(enabled=False)
+        hud.scope_overlay = SimpleNamespace(enabled=False)
+
+        hud.update_reticle(
+            WeaponKind.ANTI_AIRCRAFT,
+            GamePhase.AIRSTRIKE,
+            anti_air_scope_enabled=True,
+            whitebox_scale=1.2,
+        )
+        ordinary_scale = hud.lock_frame.scale
+        hud.update_reticle(
+            WeaponKind.MULTI_ANTI_AIRCRAFT,
+            GamePhase.AIRSTRIKE,
+            anti_air_scope_enabled=True,
+            whitebox_scale=1.2,
+            whitebox_multiplier=config.AA_MULTI_LOCK_FRAME_MULTIPLIER,
+        )
+
+        self.assertAlmostEqual(ordinary_scale, 1.2)
+        self.assertAlmostEqual(
+            hud.lock_frame.scale / ordinary_scale,
+            config.AA_MULTI_LOCK_FRAME_MULTIPLIER,
+        )
+
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from air_defense.save_data import SaveStore
+from air_defense import config
 from air_defense.state import GamePhase, GameSession
 
 
@@ -33,6 +34,11 @@ class ProfileLifecycleTests(unittest.TestCase):
         self.assertIsNone(self.session.run_state)
         restarted = self.session.start_sublevel()
         self.assertEqual(restarted.current_hp, 100.0)
+
+    def test_profile_rpg_runtime_uses_pistol_range(self) -> None:
+        run = self.session.start_sublevel()
+
+        self.assertEqual(run.weapon_runtime["RPG"].range, config.PISTOL_MAX_RANGE)
 
     def test_complete_is_idempotent_after_runstate_clear_and_persists_history(self) -> None:
         run = self.session.start_sublevel()

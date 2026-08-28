@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import unittest
 
+from air_defense import config
 from air_defense.rules import inventory_selection_allowed, is_valid_target
 from air_defense.state import AircraftPhase, AircraftType, GamePhase, WeaponKind
 
@@ -33,6 +34,28 @@ class WeaponSystemTests(unittest.TestCase):
         self.assertTrue(is_valid_target(WeaponKind.RPG, ground, distance=5.0))
         self.assertFalse(is_valid_target(WeaponKind.RPG, ground, cooldown_remaining=0.1))
         self.assertFalse(is_valid_target(WeaponKind.RPG, ground, ammo_remaining=0))
+
+    def test_rpg_uses_the_pistol_range_inclusive_boundary(self) -> None:
+        ground = SimpleNamespace(id="crew-range", alive=True, health=1, position=(0.0, 0.0, 0.0))
+        self.assertEqual(config.PISTOL_MAX_RANGE, 12.0)
+        self.assertTrue(
+            is_valid_target(
+                WeaponKind.RPG,
+                ground,
+                distance=config.PISTOL_MAX_RANGE,
+                cooldown_remaining=0.0,
+                ammo_remaining=1,
+            )
+        )
+        self.assertFalse(
+            is_valid_target(
+                WeaponKind.RPG,
+                ground,
+                distance=config.PISTOL_MAX_RANGE + 0.0001,
+                cooldown_remaining=0.0,
+                ammo_remaining=1,
+            )
+        )
 
 
 if __name__ == "__main__":

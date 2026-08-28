@@ -8,11 +8,13 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from math import floor
 import re
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Optional
+
+from . import config
 
 
 class AircraftToken(str, Enum):
@@ -81,11 +83,15 @@ class ProgressionConfig:
     rpg_ammo_per_sublevel: int = 3
     auto_defense_unlock_price: int = 600
     auto_defense_capacity_price: int = 450
+    # Kept for schema/API compatibility with the earlier turret model.  The
+    # current land-defense rules intentionally have no finite ammo pool.
     auto_defense_ammo_per_sublevel: int = 20
-    auto_defense_cooldown_seconds: float = 1.5
-    auto_defense_damage: int = 20
+    auto_defense_cooldown_seconds: float = config.AUTO_DEFENSE_FIRE_COOLDOWN_SECONDS
+    auto_defense_damage: int = config.AUTO_DEFENSE_DAMAGE
     auto_defense_hard_limit: int = 6
     multi_aa_unlock_price: int = 750
+    # These legacy values remain readable for schema-1 profiles, but they are
+    # no longer part of the active store or target-selection rules.
     multi_aa_target_price: int = 500
     multi_aa_initial_targets: int = 2
     multi_aa_hard_limit: int = 6
@@ -104,7 +110,6 @@ class ProgressionConfig:
         (UPGRADE_AA_WHITEBOX, 5),
         (UPGRADE_WEAPON_COOLDOWN, 5),
         (UPGRADE_AUTO_DEFENSE_CAPACITY, 5),
-        (UPGRADE_MULTI_AA_TARGETS, 4),
     )
     initial_unlocked_weapons: tuple[str, ...] = (
         WEAPON_ANTI_AIRCRAFT,
@@ -137,6 +142,10 @@ class ProgressionConfig:
 
         upgrade_id = normalize_upgrade_id(upgrade_id)
         count = _non_negative_int(rebirth_count, "rebirth_count")
+        if upgrade_id == UPGRADE_MULTI_AA_TARGETS:
+            # Schema-1 compatibility only.  The legacy target-count upgrade
+            # is deliberately not an active purchasable capability.
+            return 0
         base = dict(self.repeatable_base_caps).get(upgrade_id)
         if base is None:
             return 1
@@ -148,8 +157,6 @@ class ProgressionConfig:
         cap = base + growth * count
         if upgrade_id == UPGRADE_AUTO_DEFENSE_CAPACITY:
             return min(cap, self.auto_defense_hard_limit - 1)
-        if upgrade_id == UPGRADE_MULTI_AA_TARGETS:
-            return min(cap, self.multi_aa_hard_limit - self.multi_aa_initial_targets)
         return cap
 
 
@@ -386,7 +393,6 @@ def upgrade_catalog(config: ProgressionConfig = DEFAULT_CONFIG) -> tuple[Upgrade
         UpgradeCatalogEntry(UPGRADE_AUTO_DEFENSE, "陸地自動防禦", False, config.auto_defense_unlock_price, unlocks_weapon=None, effect_description="解鎖固定位置砲塔"),
         UpgradeCatalogEntry(UPGRADE_AUTO_DEFENSE_CAPACITY, "陸地自動防禦容量", True, config.auto_defense_capacity_price, caps[UPGRADE_AUTO_DEFENSE_CAPACITY], 1, hard_cap=config.auto_defense_hard_limit, prerequisite=UPGRADE_AUTO_DEFENSE, effect_description="每級增加一台砲塔"),
         UpgradeCatalogEntry(UPGRADE_MULTI_AA, "多目標防空炮", False, config.multi_aa_unlock_price, unlocks_weapon=WEAPON_MULTI_AA, effect_description="解鎖多目標防空炮"),
-        UpgradeCatalogEntry(UPGRADE_MULTI_AA_TARGETS, "多目標鎖定數量", True, config.multi_aa_target_price, caps[UPGRADE_MULTI_AA_TARGETS], 1, hard_cap=config.multi_aa_hard_limit, prerequisite=UPGRADE_MULTI_AA, effect_description="每級增加一個鎖定目標"),
     )
 
 
@@ -467,6 +473,12 @@ def effective_cooldown(base_seconds: float, profile: Any, *, config: Progression
 
 
 def multi_aa_target_count(profile: Any, *, config: ProgressionConfig = DEFAULT_CONFIG) -> int:
+    """Return the legacy count for schema/API compatibility only.
+
+    Gameplay must not call this helper: the multi-target tracker is dynamic
+    and accepts every currently eligible target.
+    """
+
     if not has_upgrade(profile, UPGRADE_MULTI_AA):
         return 0
     level = get_upgrade_level(profile, UPGRADE_MULTI_AA_TARGETS)

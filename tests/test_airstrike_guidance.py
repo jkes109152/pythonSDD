@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import math
 import unittest
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
 from air_defense import config
 from air_defense.entities import Aircraft, GuidedMissile, MissileStep
 from air_defense.rules import (
     LockOnTracker,
+    MissileVolley,
     apply_aim_assist,
     can_fire_anti_air,
     clamp_screen_radius,
@@ -370,6 +372,17 @@ class AimAssistRuleTests(unittest.TestCase):
 
 
 class GuidedMissileRuleTests(unittest.TestCase):
+    def test_missile_volley_is_immutable_and_keeps_target_pairs(self) -> None:
+        volley = MissileVolley(
+            volley_id="volley-001",
+            target_ids=(f"aircraft-{index}" for index in range(10)),
+            missile_ids=tuple((f"aircraft-{index}", f"missile-{index}") for index in range(10)),
+        )
+        self.assertEqual(len(volley.target_ids), 10)
+        self.assertEqual(volley.missile_ids[0], ("aircraft-0", "missile-0"))
+        with self.assertRaises(FrozenInstanceError):
+            volley.cooldown_applied = True
+
     def test_missile_moves_forward_and_turns_with_a_rate_limit(self) -> None:
         missile = GuidedMissile(
             id="missile-turn",

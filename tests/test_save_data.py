@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 from air_defense.save_data import SCHEMA_VERSION, SaveProfile, SaveStore
+from air_defense.progression import UPGRADE_MULTI_AA_TARGETS
 
 
 class SaveDataTests(unittest.TestCase):
@@ -71,6 +72,24 @@ class SaveDataTests(unittest.TestCase):
         profile["upgrade_levels"] = {"max_hp": 99}
         self.store.slot_path(2).write_text(json.dumps(profile), encoding="utf-8")
         self.assertTrue(self.store.load_slot(2).is_corrupt)
+
+    def test_schema_one_legacy_multi_target_level_and_snapshot_round_trip(self) -> None:
+        raw = SaveProfile(coins=12).to_dict()
+        raw["upgrade_levels"][UPGRADE_MULTI_AA_TARGETS] = 99
+        raw["upgrade_caps"][UPGRADE_MULTI_AA_TARGETS] = 123
+
+        loaded = SaveProfile.from_dict(raw)
+
+        self.assertEqual(loaded.upgrade_levels[UPGRADE_MULTI_AA_TARGETS], 99)
+        self.assertEqual(loaded.upgrade_caps[UPGRADE_MULTI_AA_TARGETS], 123)
+        self.assertEqual(
+            SaveProfile.from_dict(loaded.to_dict()).upgrade_levels[UPGRADE_MULTI_AA_TARGETS],
+            99,
+        )
+        self.assertEqual(
+            SaveProfile.from_dict(loaded.to_dict()).upgrade_caps[UPGRADE_MULTI_AA_TARGETS],
+            123,
+        )
 
     def test_delete_slot_removes_only_the_requested_profile(self) -> None:
         for slot, coins in ((1, 111), (2, 222), (3, 333)):

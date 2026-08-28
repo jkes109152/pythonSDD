@@ -7,6 +7,7 @@ import unittest
 from air_defense.progression import (
     UPGRADE_AUTO_DEFENSE,
     UPGRADE_AUTO_DEFENSE_CAPACITY,
+    UPGRADE_AA_WHITEBOX,
     UPGRADE_MAX_HP,
     UPGRADE_MULTI_AA,
     UPGRADE_MULTI_AA_TARGETS,
@@ -15,10 +16,13 @@ from air_defense.progression import (
     build_level_plan,
     calculate_rebirth_cost,
     calculate_reward,
+    effective_whitebox_scale,
     multi_aa_target_count,
     price_for_upgrade,
     purchase_upgrade,
+    upgrade_catalog,
 )
+from air_defense.entities import MultiAntiAircraftGun
 from air_defense.save_data import SaveProfile
 
 
@@ -39,7 +43,7 @@ class EconomyContractTests(unittest.TestCase):
             purchase_upgrade(profile, UPGRADE_MAX_HP)
         self.assertEqual(profile.coins, coins_before)
 
-    def test_turret_and_multi_target_hard_limits_are_not_bypassable(self) -> None:
+    def test_turret_hard_limit_remains_bounded_but_legacy_multi_target_upgrade_is_not_for_sale(self) -> None:
         profile = SaveProfile(coins=1_000_000)
         profile = purchase_upgrade(profile, UPGRADE_AUTO_DEFENSE)
         for _ in range(5):
@@ -49,11 +53,26 @@ class EconomyContractTests(unittest.TestCase):
             purchase_upgrade(profile, UPGRADE_AUTO_DEFENSE_CAPACITY)
 
         profile = purchase_upgrade(profile, UPGRADE_MULTI_AA)
-        for _ in range(4):
-            profile = purchase_upgrade(profile, UPGRADE_MULTI_AA_TARGETS)
-        self.assertEqual(multi_aa_target_count(profile), 6)
+        self.assertNotIn(
+            UPGRADE_MULTI_AA_TARGETS,
+            {entry.upgrade_id for entry in upgrade_catalog(profile.config)},
+        )
         with self.assertRaises(ValueError):
             purchase_upgrade(profile, UPGRADE_MULTI_AA_TARGETS)
+
+    def test_whitebox_upgrade_is_the_shared_source_and_multi_frame_is_fixed_ratio(self) -> None:
+        profile = SaveProfile(coins=100_000)
+        self.assertEqual(price_for_upgrade(UPGRADE_AA_WHITEBOX, 0), 250)
+        self.assertEqual(profile.upgrade_caps[UPGRADE_AA_WHITEBOX], 5)
+        profile = purchase_upgrade(profile, UPGRADE_AA_WHITEBOX)
+        self.assertAlmostEqual(effective_whitebox_scale(profile), 1.10)
+
+        gun = MultiAntiAircraftGun(world_position=(0.0, 0.0, 0.0), target_capacity=2)
+        self.assertEqual(len(gun.set_targets(tuple(f"aircraft-{i}" for i in range(12)))), 12)
+        self.assertNotIn(
+            UPGRADE_MULTI_AA_TARGETS,
+            {entry.upgrade_id for entry in upgrade_catalog(profile.config)},
+        )
 
     def test_rebirth_cost_and_apply_are_atomic(self) -> None:
         profile = SaveProfile(coins=calculate_rebirth_cost(2), rebirth_count=2)
