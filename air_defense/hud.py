@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from ursina import Button, Entity, Text, camera, color, window
 from ursina.models.procedural.circle import Circle
@@ -11,6 +11,7 @@ from ursina.models.procedural.quad import Quad
 from . import config
 from .rules import (
     CityStatusView,
+    MultiLockView,
     PlayerStatusView,
     WaveStatusView,
     WeaponCooldownView,
@@ -19,6 +20,7 @@ from .rules import (
     lock_status_label,
     inventory_selection_allowed,
     reticle_position_for_progress,
+    tracking_ring_radius,
 )
 from .save_data import SaveProfile, SaveLoadResult
 from .progression import (
@@ -31,6 +33,7 @@ from .progression import (
     upgrade_catalog,
 )
 from .state import (
+    AntiAirGuiMode,
     AircraftType,
     FailureReason,
     GamePhase,
@@ -57,6 +60,7 @@ class GameHUD:
         self.root = Entity(parent=camera.ui)
         self.gameplay_root = Entity(parent=self.root, enabled=False)
         self.menu_root = Entity(parent=self.root, enabled=False)
+        self.settings_root = Entity(parent=self.root, enabled=False)
         self.save_select_root = Entity(parent=self.root, enabled=False)
         self.shop_root = Entity(parent=self.root, enabled=False)
         self.game_over_root = Entity(parent=self.root, enabled=False)
@@ -66,7 +70,12 @@ class GameHUD:
         self.lock_ring = self._make_tracking_ring(self.gameplay_root)
         self.lock_reticle = self._make_crosshair(self.gameplay_root, 0.032)
         self.sniper_crosshair = self._make_crosshair(self.gameplay_root, 0.07)
-        self.pistol_reticle = self._make_crosshair(self.gameplay_root, 0.035)
+        normal_crosshair_size = 0.035
+        self.pistol_reticle = self._make_crosshair(self.gameplay_root, normal_crosshair_size)
+        # RPG deliberately uses the same geometry, size and color as the
+        # pistol while remaining a separate family for exclusive visibility.
+        self.rpg_reticle = self._make_crosshair(self.gameplay_root, normal_crosshair_size)
+        self.multi_reticle_pool: dict[str, Entity] = {}
         self.scope_overlay = self._make_scope_overlay(self.gameplay_root)
         self.lock_frame.enabled = False
         self.lock_ring.enabled = False
@@ -220,6 +229,7 @@ class GameHUD:
         self._build_status_cards()
 
         self._build_menu()
+        self._build_settings()
         self._build_save_select()
         self._build_shop()
         self._build_game_over()
@@ -549,6 +559,87 @@ class GameHUD:
             else "READY"
         )
 
+    def clear_transient_weapon_ui(self) -> None:
+        """Hide weapon feedback without touching domain objects or missiles.
+
+        Lifecycle boundaries call this small UI-only reset before changing the
+        scene.  In particular, an already launched guided missile belongs to
+        the game/session layer and must continue independently of this method.
+        ``getattr`` keeps the helper safe for lightweight HUD doubles used by
+        lifecycle tests and headless callers.
+        """
+
+        for widget_name in (
+            "lock_frame",
+            "lock_ring",
+            "lock_reticle",
+            "sniper_crosshair",
+            "pistol_reticle",
+            "rpg_reticle",
+            "scope_overlay",
+            "lock_label",
+            "lock_percent_text",
+            "lock_bar_background",
+            "lock_bar_fill",
+            "cooldown_bar_background",
+            "cooldown_bar_fill",
+            "cooldown_text",
+        ):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.enabled = False
+        for widget_name in ("lock_bar_fill", "cooldown_bar_fill"):
+            widget = getattr(self, widget_name, None)
+            if widget is not None:
+                widget.scale_x = 0.0
+        cooldown_text = getattr(self, "cooldown_text", None)
+        if cooldown_text is not None:
+            cooldown_text.text = ""
+        hit_text = getattr(self, "hit_text", None)
+        if hit_text is not None:
+            hit_text.text = ""
+        pool = getattr(self, "multi_reticle_pool", None)
+        if pool is not None:
+            for reticle in pool.values():
+                reticle.enabled = False
+            pool.clear()
+
+    def update_multi_lock_views(
+        self,
+        views: Iterable[MultiLockView],
+        *,
+        active: bool = True,
+    ) -> None:
+        """Render one reusable small reticle per current multi-lock target."""
+
+        pool = getattr(self, "multi_reticle_pool", None)
+        if pool is None:
+            pool = {}
+            self.multi_reticle_pool = pool
+        current_ids: set[str] = set()
+        state_colors = {
+            LockState.WHITE: _rgb(config.WHITE_RGB),
+            LockState.RED_TRACKING: _rgb(config.RED_RGB),
+            LockState.GREEN_READY: _rgb(config.GREEN_RGB),
+        }
+        for view in views:
+            target_id = str(view.target_id)
+            current_ids.add(target_id)
+            reticle = pool.get(target_id)
+            if reticle is None:
+                reticle = self._make_crosshair(self.gameplay_root, 0.032)
+                pool[target_id] = reticle
+            reticle.position = view.screen_position
+            reticle.enabled = bool(active and view.visible)
+            reticle.lock_progress = view.progress
+            reticle.lock_state = view.state
+            reticle.fireable = view.fireable
+            self._set_reticle_color(reticle, state_colors[view.state])
+        for target_id in tuple(pool):
+            if target_id not in current_ids:
+                pool[target_id].enabled = False
+                pool.pop(target_id, None)
+
     @staticmethod
     def _text(parent: Entity, text: str, **kwargs) -> Text:
         kwargs.setdefault("font", config.HUD_FONT)
@@ -708,21 +799,21 @@ class GameHUD:
         panel = Entity(
             parent=self.menu_root,
             model="quad",
-            scale=(0.72, 0.7),
+            scale=(0.74, 0.84),
             color=color.rgba32(18, 25, 38, 235),
         )
         self.menu_title = self._text(
             parent=self.menu_root,
             text="3D 防空守衛",
             origin=(0, 0),
-            y=0.22,
+            y=0.27,
             scale=2.0,
         )
         self.menu_profile_text = self._text(
             parent=self.menu_root,
             text="尚未載入存檔",
             origin=(0, 0),
-            y=0.14,
+            y=0.18,
             scale=0.68,
             color=_rgb(config.CYAN_RGB),
         )
@@ -730,7 +821,7 @@ class GameHUD:
             parent=self.menu_root,
             text="選擇功能後開始防守",
             origin=(0, 0),
-            y=0.08,
+            y=0.12,
             scale=0.85,
             color=_rgb(config.CYAN_RGB),
         )
@@ -738,14 +829,72 @@ class GameHUD:
             parent=self.menu_root,
             text="",
             origin=(0, 0),
-            y=-0.285,
+            y=-0.31,
             scale=0.52,
             color=_rgb(config.YELLOW_RGB),
         )
-        self.start_button = Button(parent=self.menu_root, text="開始遊戲", scale=(0.28, 0.075), y=-0.02)
-        self.shop_button = Button(parent=self.menu_root, text="升級商店", scale=(0.28, 0.075), y=-0.11)
-        self.rebirth_button = Button(parent=self.menu_root, text="重生", scale=(0.28, 0.075), y=-0.20)
-        self.quit_button = Button(parent=self.menu_root, text="離開遊戲", scale=(0.28, 0.075), y=-0.35)
+        self.start_button = Button(parent=self.menu_root, text="開始遊戲", scale=(0.28, 0.075), y=0.03)
+        self.shop_button = Button(parent=self.menu_root, text="升級商店", scale=(0.28, 0.075), y=-0.06)
+        self.settings_button = Button(parent=self.menu_root, text="設定", scale=(0.28, 0.075), y=-0.15)
+        self.rebirth_button = Button(parent=self.menu_root, text="重生", scale=(0.28, 0.075), y=-0.24)
+        self.quit_button = Button(parent=self.menu_root, text="離開遊戲", scale=(0.28, 0.075), y=-0.39)
+
+    def _build_settings(self) -> None:
+        Entity(
+            parent=self.settings_root,
+            model="quad",
+            scale=(0.78, 0.70),
+            color=color.rgba32(18, 25, 38, 240),
+        )
+        self._text(
+            parent=self.settings_root,
+            text="設定",
+            origin=(0, 0),
+            y=0.24,
+            scale=1.8,
+        )
+        self._text(
+            parent=self.settings_root,
+            text="防空武器瞄準介面",
+            origin=(0, 0),
+            y=0.15,
+            scale=0.82,
+            color=_rgb(config.CYAN_RGB),
+        )
+        self.settings_mode_text = self._text(
+            parent=self.settings_root,
+            text="目前：新版防空瞄準",
+            origin=(0, 0),
+            y=0.075,
+            scale=0.72,
+            color=_rgb(config.YELLOW_RGB),
+        )
+        self.settings_new_button = Button(
+            parent=self.settings_root,
+            text="新版防空瞄準",
+            scale=(0.36, 0.075),
+            y=-0.015,
+        )
+        self.settings_legacy_button = Button(
+            parent=self.settings_root,
+            text="舊版圓圈鎖定",
+            scale=(0.36, 0.075),
+            y=-0.115,
+        )
+        self._text(
+            parent=self.settings_root,
+            text="新版：白框與多目標小準心\n舊版：普通防空炮以圓圈鎖定飛機",
+            origin=(0, 0),
+            y=-0.215,
+            scale=0.58,
+            color=_rgb(config.HUD_TEXT_RGB),
+        )
+        self.settings_back_button = Button(
+            parent=self.settings_root,
+            text="返回主選單",
+            scale=(0.30, 0.07),
+            y=-0.315,
+        )
 
     def _build_save_select(self) -> None:
         Entity(
@@ -914,9 +1063,32 @@ class GameHUD:
             y=-0.18,
         )
 
-    def bind_menu_actions(self, start: Callable[[], None], quit_game: Callable[[], None]) -> None:
+    @staticmethod
+    def _normalize_anti_air_gui_mode(mode: AntiAirGuiMode | str) -> AntiAirGuiMode:
+        try:
+            return mode if isinstance(mode, AntiAirGuiMode) else AntiAirGuiMode(mode)
+        except (TypeError, ValueError):
+            return AntiAirGuiMode.NEW
+
+    def bind_menu_actions(
+        self,
+        start: Callable[[], None],
+        quit_game: Callable[[], None],
+        open_settings: Optional[Callable[[], None]] = None,
+    ) -> None:
         self.start_button.on_click = start
         self.quit_button.on_click = quit_game
+        if open_settings is not None:
+            self.settings_button.on_click = open_settings
+
+    def bind_settings_actions(
+        self,
+        set_mode: Callable[[AntiAirGuiMode], None],
+        back_to_menu: Callable[[], None],
+    ) -> None:
+        self.settings_new_button.on_click = lambda: set_mode(AntiAirGuiMode.NEW)
+        self.settings_legacy_button.on_click = lambda: set_mode(AntiAirGuiMode.LEGACY)
+        self.settings_back_button.on_click = back_to_menu
 
     def bind_progression_actions(
         self,
@@ -1080,6 +1252,8 @@ class GameHUD:
     def show_main_menu(self) -> None:
         self.menu_root.enabled = True
         self.gameplay_root.enabled = False
+        if hasattr(self, "settings_root"):
+            self.settings_root.enabled = False
         if hasattr(self, "save_select_root"):
             self.save_select_root.enabled = False
         if hasattr(self, "shop_root"):
@@ -1091,6 +1265,8 @@ class GameHUD:
     def show_gameplay(self) -> None:
         self.menu_root.enabled = False
         self.gameplay_root.enabled = True
+        if hasattr(self, "settings_root"):
+            self.settings_root.enabled = False
         if hasattr(self, "save_select_root"):
             self.save_select_root.enabled = False
         if hasattr(self, "shop_root"):
@@ -1107,6 +1283,8 @@ class GameHUD:
     ) -> None:
         self.menu_root.enabled = False
         self.gameplay_root.enabled = False
+        if hasattr(self, "settings_root"):
+            self.settings_root.enabled = False
         self.save_select_root.enabled = True
         self.shop_root.enabled = False
         self.game_over_root.enabled = False
@@ -1119,6 +1297,8 @@ class GameHUD:
     def show_shop(self, profile: Optional[SaveProfile]) -> None:
         self.menu_root.enabled = False
         self.gameplay_root.enabled = False
+        if hasattr(self, "settings_root"):
+            self.settings_root.enabled = False
         self.save_select_root.enabled = False
         self.shop_root.enabled = True
         self.game_over_root.enabled = False
@@ -1129,6 +1309,8 @@ class GameHUD:
 
     def show_game_over(self, stats: SessionStats) -> None:
         self.menu_root.enabled = False
+        if hasattr(self, "settings_root"):
+            self.settings_root.enabled = False
         if hasattr(self, "save_select_root"):
             self.save_select_root.enabled = False
         if hasattr(self, "shop_root"):
@@ -1156,6 +1338,8 @@ class GameHUD:
         """Show a frozen final result without adding descent-specific HUD."""
 
         self.menu_root.enabled = False
+        if hasattr(self, "settings_root"):
+            self.settings_root.enabled = False
         if hasattr(self, "save_select_root"):
             self.save_select_root.enabled = False
         if hasattr(self, "shop_root"):
@@ -1170,6 +1354,42 @@ class GameHUD:
             f"擊倒敵人 {stats.enemies_defeated}  名"
         )
 
+    def show_settings(self, mode: AntiAirGuiMode | str = AntiAirGuiMode.NEW) -> None:
+        """顯示防空介面選擇頁，不改變目前 Profile 或戰鬥狀態。"""
+
+        self.menu_root.enabled = False
+        self.gameplay_root.enabled = False
+        if hasattr(self, "save_select_root"):
+            self.save_select_root.enabled = False
+        if hasattr(self, "shop_root"):
+            self.shop_root.enabled = False
+        self.game_over_root.enabled = False
+        if hasattr(self, "victory_root"):
+            self.victory_root.enabled = False
+        self.settings_root.enabled = True
+        self.update_settings_mode(mode)
+
+    def update_settings_mode(self, mode: AntiAirGuiMode | str) -> None:
+        """更新設定頁的選取狀態與按鈕提示。"""
+
+        normalized = self._normalize_anti_air_gui_mode(mode)
+        if not hasattr(self, "settings_mode_text"):
+            return
+        if normalized == AntiAirGuiMode.LEGACY:
+            self.settings_mode_text.text = "目前：舊版圓圈鎖定"
+        else:
+            self.settings_mode_text.text = "目前：新版防空瞄準"
+        selected_color = color.rgb(42, 112, 145)
+        idle_color = color.rgb(42, 48, 60)
+        if hasattr(self, "settings_new_button"):
+            self.settings_new_button.color = (
+                selected_color if normalized == AntiAirGuiMode.NEW else idle_color
+            )
+        if hasattr(self, "settings_legacy_button"):
+            self.settings_legacy_button.color = (
+                selected_color if normalized == AntiAirGuiMode.LEGACY else idle_color
+            )
+
     def update_lock(
         self,
         state: LockState,
@@ -1181,34 +1401,69 @@ class GameHUD:
         target_radius: float = 0.008,
         completion_flash: bool = False,
         whitebox_scale: float = 1.0,
+        anti_air_gui_mode: AntiAirGuiMode | str = AntiAirGuiMode.NEW,
     ) -> None:
+        gui_mode = self._normalize_anti_air_gui_mode(anti_air_gui_mode)
+        legacy_single_lock = gui_mode == AntiAirGuiMode.LEGACY
         whitebox_scale = max(0.1, float(whitebox_scale))
+        clamped_progress = max(0.0, min(1.0, float(progress)))
         self.lock_frame.scale = whitebox_scale
-        self.lock_frame.enabled = active
-        # The frame is a fixed white boundary. Target feedback belongs to the
-        # separate small reticle and must never recolor this frame.
-        self.lock_ring.enabled = False
-        self.lock_reticle.enabled = active
+        # The legacy presentation is the original 003 HUD: the enlarged
+        # fixed frame stays visible together with the continuous follow ring.
+        # The newer presentation reserves the fixed frame for its own reticle.
+        self.lock_frame.enabled = bool(active)
+        # New mode keeps the frame white; the legacy 003 mode colors the
+        # original frame together with its tracking feedback.
+        lock_ring = getattr(self, "lock_ring", None)
+        if lock_ring is not None:
+            lock_ring.enabled = bool(active and legacy_single_lock and target_position is not None)
+            if target_position is not None:
+                lock_ring.position = target_position
+                radius = tracking_ring_radius(
+                    config.AA_LOCK_RING_ACQUISITION_RADIUS,
+                    target_radius,
+                    clamped_progress,
+                    padding=config.AA_LOCK_RING_PADDING,
+                )
+                base_radius = max(1e-6, config.AA_LOCK_RING_ACQUISITION_RADIUS)
+                ratio = radius / base_radius
+                lock_ring.scale = (ratio, ratio, 1.0)
+            else:
+                lock_ring.position = (0.0, 0.0)
+                lock_ring.scale = (1.0, 1.0, 1.0)
+        self.lock_reticle.enabled = bool(active and not legacy_single_lock)
         self.lock_label.enabled = active
         self.lock_percent_text.enabled = active
         self.lock_bar_background.enabled = active
         self.lock_bar_fill.enabled = active
-        for child in self.lock_frame.children:
-            child.color = _rgb(config.WHITE_RGB)
         if state == LockState.WHITE:
             tint = _rgb(config.WHITE_RGB)
         elif state == LockState.RED_TRACKING:
-            tint = _rgb(config.RED_RGB) if visible else _rgb(config.WHITE_RGB)
+            tint = (
+                _rgb(config.RED_RGB)
+                if visible
+                else color.rgba(0, 0, 0, 0)
+                if legacy_single_lock
+                else _rgb(config.WHITE_RGB)
+            )
         else:
             tint = _rgb(config.RED_RGB) if completion_flash else _rgb(config.GREEN_RGB)
+        frame_tint = tint if legacy_single_lock else _rgb(config.WHITE_RGB)
+        for child in getattr(self.lock_frame, "children", ()):
+            child.color = frame_tint
         self._set_reticle_color(self.lock_reticle, tint)
+        if lock_ring is not None:
+            lock_ring.color = tint
         self.lock_label.text = lock_status_label(state)
         # Keep all lock labels readable in the transparent HUD; state color is
         # carried by the small reticle and bars instead of the text.
-        self.lock_label.color = _rgb(config.WHITE_RGB)
-        clamped_progress = max(0.0, min(1.0, float(progress)))
+        self.lock_label.color = (
+            _rgb(config.GREEN_RGB)
+            if legacy_single_lock and state == LockState.GREEN_READY
+            else _rgb(config.WHITE_RGB)
+        )
         self.lock_percent_text.text = f"鎖定 {clamped_progress * 100.0:.0f}%"
-        self.lock_percent_text.color = _rgb(config.WHITE_RGB)
+        self.lock_percent_text.color = self.lock_label.color
         self.lock_bar_fill.scale_x = config.AA_LOCK_PROGRESS_BAR_WIDTH * clamped_progress
         self.lock_bar_fill.color = tint
         frame_half = config.AA_LOCK_FRAME_SIZE * whitebox_scale / 2.0
@@ -1228,9 +1483,12 @@ class GameHUD:
         scope_enabled: bool = False,
         anti_air_scope_enabled: bool = False,
         whitebox_scale: float = 1.0,
+        whitebox_multiplier: float = 1.0,
+        anti_air_gui_mode: AntiAirGuiMode | str = AntiAirGuiMode.NEW,
     ) -> None:
         """Show exactly one weapon reticle family for the active phase/slot."""
 
+        gui_mode = self._normalize_anti_air_gui_mode(anti_air_gui_mode)
         anti_air_equipped = (
             phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
             and weapon in (WeaponKind.ANTI_AIRCRAFT, WeaponKind.MULTI_ANTI_AIRCRAFT)
@@ -1238,14 +1496,29 @@ class GameHUD:
         anti_air_scope_active = anti_air_equipped and anti_air_scope_enabled
         sniper_active = phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT) and weapon == WeaponKind.SNIPER
         pistol_active = phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT) and weapon == WeaponKind.PISTOL
+        rpg_active = phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT) and weapon == WeaponKind.RPG
+        legacy_single_lock = (
+            gui_mode == AntiAirGuiMode.LEGACY
+            and weapon == WeaponKind.ANTI_AIRCRAFT
+        )
         # The enlarged fixed frame remains visible while the anti-air weapon
         # is equipped; dynamic lock feedback is scope-only.
-        self.lock_frame.scale = max(0.1, float(whitebox_scale))
-        self.lock_frame.enabled = anti_air_equipped
+        self.lock_frame.scale = max(
+            0.1,
+            float(whitebox_scale) * max(0.0, float(whitebox_multiplier)),
+        )
+        self.lock_frame.enabled = bool(anti_air_equipped)
+        lock_ring = getattr(self, "lock_ring", None)
+        if lock_ring is not None:
+            if not (anti_air_scope_active and legacy_single_lock):
+                lock_ring.enabled = False
         self.lock_label.enabled = anti_air_scope_active
-        self.lock_reticle.enabled = anti_air_scope_active
+        self.lock_reticle.enabled = bool(anti_air_scope_active and not legacy_single_lock)
         self.sniper_crosshair.enabled = sniper_active
         self.pistol_reticle.enabled = pistol_active
+        rpg_reticle = getattr(self, "rpg_reticle", None)
+        if rpg_reticle is not None:
+            rpg_reticle.enabled = rpg_active
         self.scope_overlay.enabled = sniper_active and scope_enabled
 
     def update_session(
@@ -1284,7 +1557,9 @@ class GameHUD:
         city_view: Optional[CityStatusView] = None,
         wave_view: Optional[WaveStatusView] = None,
         cooldown_view: Optional[WeaponCooldownView] = None,
+        multi_lock_views: Optional[Iterable[MultiLockView]] = None,
         lock_completion_flash: bool = False,
+        anti_air_gui_mode: AntiAirGuiMode | str = AntiAirGuiMode.NEW,
     ) -> None:
         try:
             normalized_weapon = (
@@ -1418,15 +1693,30 @@ class GameHUD:
             cooldown_view,
             visible=phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT),
         )
+        multi_lock_active = (
+            normalized_weapon == WeaponKind.MULTI_ANTI_AIRCRAFT
+            and anti_air_scope_enabled
+            and phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT)
+        )
+        self.update_multi_lock_views(
+            multi_lock_views or (),
+            active=multi_lock_active,
+        )
+        whitebox_multiplier = (
+            config.AA_MULTI_LOCK_FRAME_MULTIPLIER
+            if normalized_weapon == WeaponKind.MULTI_ANTI_AIRCRAFT
+            else 1.0
+        )
         self.update_lock(
             lock_state,
             lock_visible,
-            active=anti_air_scope_enabled and phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT) and weapon in (WeaponKind.ANTI_AIRCRAFT, WeaponKind.MULTI_ANTI_AIRCRAFT),
+            active=anti_air_scope_enabled and phase in (GamePhase.AIRSTRIKE, GamePhase.HYBRID_COMBAT, GamePhase.GROUND_COMBAT) and normalized_weapon == WeaponKind.ANTI_AIRCRAFT,
             progress=lock_progress,
             target_position=lock_target_position,
             target_radius=lock_target_radius,
             completion_flash=lock_completion_flash,
-            whitebox_scale=whitebox_scale,
+            whitebox_scale=whitebox_scale * whitebox_multiplier,
+            anti_air_gui_mode=anti_air_gui_mode,
         )
         self.update_reticle(
             normalized_weapon,
@@ -1434,6 +1724,8 @@ class GameHUD:
             scope_enabled=scope_enabled,
             anti_air_scope_enabled=anti_air_scope_enabled,
             whitebox_scale=whitebox_scale,
+            whitebox_multiplier=whitebox_multiplier,
+            anti_air_gui_mode=anti_air_gui_mode,
         )
 
     def update_boss_health(

@@ -196,10 +196,11 @@ class LockOnTracker:
 
 
 class MultiLockOnTracker:
-    """多目標防空炮的有序鎖定追蹤器。
+    """多目標防空炮的動態、有序鎖定追蹤器。
 
-    每個目標使用獨立的 `LockOnTracker`，因此切換其中一個目標不會重置
-    其他目標的鎖定進度；齊射時由 `fireable_targets` 產生去重快照。
+    ``target_capacity`` remains as an ignored source-compatibility keyword.
+    The live target list is always derived from the current projection set and
+    therefore is not limited by the old two- or six-target values.
     """
 
     def __init__(
@@ -207,13 +208,18 @@ class MultiLockOnTracker:
         target_capacity: int = 2,
         lock_duration: float = LOCK_DURATION_SECONDS,
         decay_duration: float = AA_LOCK_DECAY_SECONDS,
+        *,
+        scope_enabled: bool = False,
     ) -> None:
+        # Keep the attribute for old integrations that inspect it, but never
+        # consult it when constructing the target set.
         self.target_capacity = max(0, int(target_capacity))
         self.lock_duration = max(1e-6, float(lock_duration))
         self.decay_duration = max(1e-6, float(decay_duration))
         self.targets: list[str] = []
         self.trackers: dict[str, LockOnTracker] = {}
         self.volley_id: Optional[str] = None
+        self.scope_enabled = bool(scope_enabled)
 
     @property
     def target_ids(self) -> tuple[str, ...]:
@@ -231,14 +237,35 @@ class MultiLockOnTracker:
             if self.trackers[target_id].fireable
         )
 
+    @property
+    def all_targets_ready(self) -> bool:
+        """Whether every current target is independently ready to fire."""
+
+        return bool(self.targets) and all(
+            self.trackers[target_id].fireable for target_id in self.targets
+        )
+
+    @property
+    def fireable_target_ids(self) -> tuple[str, ...]:
+        """Return a complete, immutable firing snapshot or an empty tuple."""
+
+        return self.target_ids if self.all_targets_ready else ()
+
+    def set_scope_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if not enabled:
+            self.reset()
+            return
+        self.scope_enabled = True
+        for tracker in self.trackers.values():
+            tracker.scope_enabled = True
+
     def set_targets(self, target_ids: Sequence[str]) -> tuple[str, ...]:
         ordered: list[str] = []
         for target_id in target_ids:
             value = str(target_id)
             if value not in ordered:
                 ordered.append(value)
-            if len(ordered) >= self.target_capacity:
-                break
         old = self.trackers
         self.targets = ordered
         self.trackers = {
@@ -247,14 +274,14 @@ class MultiLockOnTracker:
                 LockOnTracker(
                     self.lock_duration,
                     self.decay_duration,
-                    scope_enabled=True,
+                    scope_enabled=self.scope_enabled,
                     target_aircraft_id=target_id,
                 ),
             )
             for target_id in ordered
         }
         for tracker in self.trackers.values():
-            tracker.scope_enabled = True
+            tracker.scope_enabled = self.scope_enabled
         return self.target_ids
 
     def update(
@@ -273,6 +300,21 @@ class MultiLockOnTracker:
         if not scope_enabled:
             self.reset()
             return ()
+
+        self.scope_enabled = True
+        existing = tuple(self.targets)
+        retained: list[str] = []
+        for target_id in existing:
+            candidate = candidate_map.get(target_id)
+            if not _candidate_is_eligible(candidate):
+                continue
+            retained.append(target_id)
+        incoming = [
+            candidate_id
+            for candidate_id, candidate in candidate_map.items()
+            if _candidate_is_eligible(candidate) and _candidate_in_frame(candidate)
+        ]
+        self.set_targets((*retained, *incoming))
         for target_id in tuple(self.targets):
             candidate = candidate_map.get(target_id)
             tracker = self.trackers[target_id]
@@ -284,13 +326,23 @@ class MultiLockOnTracker:
                 target_in_frame=in_frame,
                 target_aircraft_id=target_id,
             )
+        # A visible target may decay for a short time outside the frame.  Once
+        # its independent buffer reaches zero, release only that target.
+        expired = [
+            target_id
+            for target_id in self.targets
+            if self.trackers[target_id].lock_elapsed <= 0.0
+            and not _candidate_in_frame(candidate_map.get(target_id))
+        ]
+        if expired:
+            self.set_targets(tuple(target_id for target_id in self.targets if target_id not in expired))
         return self.ready_target_ids
 
     def fireable_targets(self) -> tuple[str, ...]:
-        return self.ready_target_ids
+        return self.fireable_target_ids
 
     def mark_fired(self, volley_id: Optional[str] = None) -> tuple[str, ...]:
-        ready = self.ready_target_ids
+        ready = self.fireable_target_ids
         if not ready:
             return ()
         self.volley_id = str(volley_id) if volley_id is not None else None
@@ -300,10 +352,121 @@ class MultiLockOnTracker:
             self.trackers[target_id].target_aircraft_id = target_id
         return ready
 
+    def build_views(self, candidates: Mapping[str, object] | Sequence[object]) -> tuple["MultiLockView", ...]:
+        """Compose read-only HUD views without storing a second progress map."""
+
+        candidate_map: dict[str, object] = {}
+        values = candidates.values() if isinstance(candidates, Mapping) else candidates
+        for candidate in values:
+            candidate_id = _candidate_id(candidate)
+            if candidate_id is not None:
+                candidate_map[candidate_id] = candidate
+        views: list[MultiLockView] = []
+        for target_id in self.targets:
+            tracker = self.trackers[target_id]
+            candidate = candidate_map.get(target_id)
+            position = getattr(candidate, "hud_position", None)
+            if position is None:
+                position = getattr(candidate, "screen_position", (0.0, 0.0))
+            try:
+                screen_position = (float(position[0]), float(position[1]))
+            except (TypeError, ValueError, IndexError):
+                screen_position = (0.0, 0.0)
+            alive = bool(getattr(candidate, "alive", True))
+            eligible = bool(getattr(candidate, "eligible", True))
+            visible = bool(getattr(candidate, "visible", candidate is not None)) and alive
+            in_frame = _candidate_in_frame(candidate)
+            if visible and eligible and tracker.state == LockState.GREEN_READY and in_frame:
+                state = LockState.GREEN_READY
+            elif visible and tracker.progress > 0.0:
+                state = LockState.RED_TRACKING
+            else:
+                state = LockState.WHITE
+            views.append(
+                MultiLockView(
+                    target_id=target_id,
+                    screen_position=screen_position,
+                    progress=tracker.progress,
+                    state=state,
+                    visible=visible,
+                    fireable=bool(
+                        self.all_targets_ready
+                        and tracker.fireable
+                        and visible
+                        and eligible
+                        and in_frame
+                    ),
+                )
+            )
+        return tuple(views)
+
+    # Short aliases keep the view API discoverable for scene/HUD adapters.
+    views = build_views
+    view = build_views
+
     def reset(self) -> None:
         self.targets.clear()
         self.trackers.clear()
         self.volley_id = None
+        self.scope_enabled = False
+
+
+@dataclass(frozen=True)
+class MultiLockView:
+    """Read-only projection of one multi-lock target for the HUD."""
+
+    target_id: str
+    screen_position: Vector2
+    progress: float
+    state: LockState
+    visible: bool
+    fireable: bool
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "target_id", str(self.target_id))
+        object.__setattr__(
+            self,
+            "screen_position",
+            (float(self.screen_position[0]), float(self.screen_position[1])),
+        )
+        object.__setattr__(self, "progress", max(0.0, min(1.0, float(self.progress))))
+        object.__setattr__(self, "state", LockState(self.state))
+        object.__setattr__(self, "visible", bool(self.visible))
+        object.__setattr__(self, "fireable", bool(self.fireable))
+
+
+@dataclass(frozen=True)
+class MissileVolley:
+    """Immutable multi-target launch snapshot; missiles remain independently bound."""
+
+    volley_id: str
+    target_ids: tuple[str, ...] = ()
+    missile_ids: tuple[tuple[str, str], ...] = ()
+    weapon: WeaponKind = WeaponKind.MULTI_ANTI_AIRCRAFT
+    cooldown_applied: bool = False
+
+    def __post_init__(self) -> None:
+        target_ids = tuple(str(target_id) for target_id in self.target_ids)
+        missile_ids = tuple(
+            (str(target_id), str(missile_id)) for target_id, missile_id in self.missile_ids
+        )
+        if len(target_ids) != len(set(target_ids)):
+            raise ValueError("volley target IDs must be unique")
+        if missile_ids and len(missile_ids) != len(target_ids):
+            raise ValueError("one missile is required for each volley target")
+        if missile_ids and tuple(pair[0] for pair in missile_ids) != target_ids:
+            raise ValueError("missile pairs must preserve target order")
+        object.__setattr__(self, "volley_id", str(self.volley_id))
+        object.__setattr__(self, "target_ids", target_ids)
+        object.__setattr__(self, "missile_ids", missile_ids)
+        object.__setattr__(self, "weapon", WeaponKind(self.weapon))
+        object.__setattr__(self, "cooldown_applied", bool(self.cooldown_applied))
+
+    @property
+    def active(self) -> bool:
+        """A launch with at least one registered missile is still active."""
+
+        return bool(self.missile_ids)
 
 
 Vector3 = tuple[float, float, float]
@@ -591,6 +754,21 @@ def _candidate_in_frame(candidate: object) -> bool:
     if value is None:
         value = getattr(candidate, "in_lock_zone", False)
     return bool(value)
+
+
+def _candidate_is_eligible(candidate: object | None) -> bool:
+    """Return whether a projection may remain in the dynamic lock set."""
+
+    if candidate is None:
+        return False
+    if not bool(getattr(candidate, "visible", True)):
+        return False
+    if not bool(getattr(candidate, "eligible", True)):
+        return False
+    if not bool(getattr(candidate, "alive", True)):
+        return False
+    phase = getattr(candidate, "phase", None)
+    return phase not in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED, "DESTROYED", "IMPACTED")
 
 
 def select_lock_target(
@@ -1284,7 +1462,7 @@ def is_valid_target(
             limit = {
                 WeaponKind.PISTOL: config.PISTOL_MAX_RANGE,
                 WeaponKind.SNIPER: config.SNIPER_MAX_RANGE,
-                WeaponKind.RPG: config.SNIPER_MAX_RANGE,
+                WeaponKind.RPG: config.PISTOL_MAX_RANGE,
                 WeaponKind.ANTI_AIRCRAFT: config.SNIPER_MAX_RANGE,
                 WeaponKind.MULTI_ANTI_AIRCRAFT: config.SNIPER_MAX_RANGE,
             }[kind]
@@ -1416,21 +1594,82 @@ def _claim_rpg_hit(
 resolve_rpg_explosion = apply_rpg_explosion
 
 
+def can_auto_defense_target(
+    target: object,
+    *,
+    allow_boss: bool = True,
+    boss_damage_floor_ratio: float = config.AUTO_DEFENSE_BOSS_DAMAGE_FLOOR_RATIO,
+) -> bool:
+    """Return whether an auto-defense shot may damage this ground target.
+
+    Bosses are allowed only while they are above the configured remaining-HP
+    floor.  The caller still owns range checks because a turret has a world
+    position while this pure predicate only validates target state.
+    """
+
+    if target is None or not _target_is_alive(target) or _target_is_aircraft(target):
+        return False
+    if not _target_is_landed(target):
+        return False
+    if _target_is_boss(target):
+        if not allow_boss:
+            return False
+        maximum = float(_object_value(target, "max_health", 0.0) or 0.0)
+        current = float(_object_value(target, "health", 0.0) or 0.0)
+        if maximum <= 0.0:
+            return False
+        ratio = max(0.0, min(1.0, float(boss_damage_floor_ratio)))
+        return current > maximum * ratio + 1e-6
+    return True
+
+
+def auto_defense_damage_for_target(
+    target: object,
+    requested_damage: int = config.AUTO_DEFENSE_DAMAGE,
+    *,
+    boss_damage_floor_ratio: float = config.AUTO_DEFENSE_BOSS_DAMAGE_FLOOR_RATIO,
+) -> int:
+    """Clamp one auto-defense shot without allowing a Boss below half HP."""
+
+    damage = max(0, int(requested_damage))
+    if damage <= 0 or not can_auto_defense_target(
+        target,
+        allow_boss=True,
+        boss_damage_floor_ratio=boss_damage_floor_ratio,
+    ):
+        return 0
+    if not _target_is_boss(target):
+        return damage
+    maximum = float(_object_value(target, "max_health", 0.0) or 0.0)
+    current = float(_object_value(target, "health", 0.0) or 0.0)
+    ratio = max(0.0, min(1.0, float(boss_damage_floor_ratio)))
+    floor_health = ceil(maximum * ratio)
+    return min(damage, max(0, int(current - floor_health)))
+
+
 def select_turret_target(
     position: Vector3,
     enemies: Mapping[object, object] | Sequence[object],
     *,
     max_range: Optional[float] = None,
+    allow_boss: bool = False,
+    boss_damage_floor_ratio: float = config.AUTO_DEFENSE_BOSS_DAMAGE_FLOOR_RATIO,
 ) -> Optional[object]:
-    """選擇距離最近、已落地、非 Boss 的小兵；同距離以穩定 ID 排序。"""
+    """選擇距離最近的可攻擊地面敵人；同距離以穩定 ID 排序。
+
+    The legacy default still excludes Boss targets for external callers.  The
+    live land-defense controller opts into Boss targets with a 50% HP floor.
+    """
 
     values = enemies.values() if isinstance(enemies, Mapping) else enemies
     candidates: list[tuple[float, str, object]] = []
     limit = None if max_range is None else max(0.0, float(max_range))
     for enemy in values:
-        if not _target_is_alive(enemy) or _target_is_aircraft(enemy):
-            continue
-        if _target_is_boss(enemy) or not _target_is_landed(enemy):
+        if not can_auto_defense_target(
+            enemy,
+            allow_boss=allow_boss,
+            boss_damage_floor_ratio=boss_damage_floor_ratio,
+        ):
             continue
         identifier = target_identifier(enemy)
         enemy_position = target_position(enemy)
@@ -1934,8 +2173,16 @@ class EncounterFactory:
                         if is_boss
                         else config.GROUND_MOVE_SPEED
                     ),
-                    health=config.GROUND_BOSS_HEALTH if is_boss else 1,
-                    max_health=config.GROUND_BOSS_HEALTH if is_boss else 1,
+                    health=(
+                        config.GROUND_BOSS_HEALTH
+                        if is_boss
+                        else config.GROUND_MINION_HEALTH
+                    ),
+                    max_health=(
+                        config.GROUND_BOSS_HEALTH
+                        if is_boss
+                        else config.GROUND_MINION_HEALTH
+                    ),
                     is_boss=is_boss,
                 )
             )

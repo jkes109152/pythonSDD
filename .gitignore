@@ -42,3 +42,12 @@ Panda3D-1.10/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local-only 3D source and generated runtime assets
+遊戲3d/*.stl
+遊戲3d/*.stl.tmp
+assets/air_defense/models/*.obj
+assets/air_defense/models/*.obj.tmp
+assets/air_defense/models/*.part
+assets/air_defense/models/.tmp/
+assets/air_defense/models/asset_axis_calibration.json

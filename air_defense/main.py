@@ -19,6 +19,7 @@ from .entities import (
     MultiAntiAircraftGun,
     Pistol,
     Player,
+    RPGProjectileEffect,
     RPGWeapon,
     SniperRifle,
     TargetBuilding,
@@ -27,11 +28,13 @@ from .hud import GameHUD
 from .rules import (
     EncounterFactory,
     LockOnTracker,
+    MissileVolley,
     MultiLockOnTracker,
     advance_crew_behavior,
     apply_city_damage,
     apply_enemy_hit,
     apply_guided_missile_damage,
+    auto_defense_damage_for_target,
     can_fire_anti_air,
     can_fire_pistol,
     can_fire_sniper,
@@ -51,19 +54,18 @@ from .rules import (
     warning_active,
 )
 from .scene import AirDefenseScene, distance_xz
-from .save_data import SaveLoadResult, SaveProfile, SaveStore
+from .save_data import SaveLoadResult, SaveStore
 from .progression import (
     effective_cooldown,
     effective_lock_duration,
     effective_whitebox_scale,
     has_upgrade,
-    multi_aa_target_count,
     upgrade_catalog,
 )
 from .state import (
+    AntiAirGuiMode,
     CrewBehaviorState,
     AircraftPhase,
-    FailureReason,
     GamePhase,
     GameSession,
     LockState,
@@ -103,6 +105,7 @@ class AirDefenseGame:
         self._fps_sample_frames = 0
         self._fps_value: Optional[float] = None
         self.active_missiles: dict[str, GuidedMissile] = {}
+        self.active_volleys: dict[str, MissileVolley] = {}
         self._missile_sequence = 0
         self._rpg_explosion_sequence = 0
         self._aircraft_screen_target = None
@@ -110,8 +113,11 @@ class AirDefenseGame:
         self._tracer_event_ids: set[str] = set()
         self._game_over_snapshot: Optional[dict[str, object]] = None
         self._victory_presented = False
+        self.anti_air_gui_mode = AntiAirGuiMode.NEW
+        self._settings_open = False
 
-        self.hud.bind_menu_actions(self.start_game, self.quit_game)
+        self.hud.bind_menu_actions(self.start_game, self.quit_game, self.open_settings)
+        self.hud.bind_settings_actions(self.set_anti_air_gui_mode, self.close_settings)
         self.hud.bind_progression_actions(
             self.select_save_slot,
             self.open_shop,
@@ -127,6 +133,7 @@ class AirDefenseGame:
     def start_game(self) -> None:
         if self.session.phase != GamePhase.MAIN_MENU:
             return
+        self._settings_open = False
         if self.session.profile is not None:
             self._start_profile_sublevel()
             return
@@ -174,6 +181,7 @@ class AirDefenseGame:
             next_level=self.session.session_progress.next_play_level,
         )
         self.hud.show_main_menu()
+        self._settings_open = False
         self.scene.set_gameplay_enabled(False)
         return result
 
@@ -191,9 +199,37 @@ class AirDefenseGame:
         self.scene.set_gameplay_enabled(False)
 
     def open_shop(self) -> None:
+        self._settings_open = False
         if self.session.open_shop() != GamePhase.SHOP:
             return
         self.hud.show_shop(self.session.profile)
+
+    def open_settings(self) -> None:
+        """Open the session-only anti-air HUD preference page."""
+
+        if self.session.phase != GamePhase.MAIN_MENU:
+            return
+        self._settings_open = True
+        self.hud.show_settings(self.anti_air_gui_mode)
+
+    def close_settings(self) -> None:
+        """Return from settings without changing gameplay or Profile data."""
+
+        self._settings_open = False
+        if self.session.phase == GamePhase.MAIN_MENU:
+            self.hud.show_main_menu()
+
+    def set_anti_air_gui_mode(self, mode: AntiAirGuiMode | str) -> None:
+        """Select the visual anti-air interface; weapon rules remain shared."""
+
+        try:
+            self.anti_air_gui_mode = (
+                mode if isinstance(mode, AntiAirGuiMode) else AntiAirGuiMode(mode)
+            )
+        except (TypeError, ValueError):
+            return
+        if self._settings_open:
+            self.hud.update_settings_mode(self.anti_air_gui_mode)
 
     def purchase_upgrade(self, upgrade_id: str) -> None:
         """結算一次商店操作，鍵盤與按鈕共用同一個冪等入口。"""
@@ -273,10 +309,6 @@ class AirDefenseGame:
         )
         self.multi_anti_aircraft = MultiAntiAircraftGun(
             world_position=config.DEFENSE_POINT_POSITION,
-            target_capacity=multi_aa_target_count(
-                self.session.profile,
-                config=self.session.progression_config,
-            ),
         )
         self.turrets = run.turrets
         lock_duration = effective_lock_duration(
@@ -285,10 +317,6 @@ class AirDefenseGame:
         )
         self.lock_tracker.lock_duration = lock_duration
         self.multi_lock_tracker = MultiLockOnTracker(
-            target_capacity=multi_aa_target_count(
-                self.session.profile,
-                config=self.session.progression_config,
-            ),
             lock_duration=lock_duration,
         )
         self._reset_airstrike_guidance(clear_missiles=True)
@@ -342,6 +370,7 @@ class AirDefenseGame:
         self._tracer_event_ids.clear()
         self.scene.set_scope_enabled(False)
         self._game_over_presented = False
+        self._settings_open = False
         self.hud.show_main_menu()
         if self.session.profile is not None:
             self.hud.update_profile_summary(
@@ -376,6 +405,19 @@ class AirDefenseGame:
             return
 
         if self.session.phase == GamePhase.MAIN_MENU:
+            if getattr(self, "_settings_open", False):
+                if key in ("escape", "backspace"):
+                    self.close_settings()
+                elif key == "q":
+                    self.quit_game()
+                elif key == "left mouse down":
+                    if getattr(self.hud, "settings_new_button", None) is not None and self.hud.settings_new_button.hovered:
+                        self.set_anti_air_gui_mode(AntiAirGuiMode.NEW)
+                    elif getattr(self.hud, "settings_legacy_button", None) is not None and self.hud.settings_legacy_button.hovered:
+                        self.set_anti_air_gui_mode(AntiAirGuiMode.LEGACY)
+                    elif getattr(self.hud, "settings_back_button", None) is not None and self.hud.settings_back_button.hovered:
+                        self.close_settings()
+                return
             if key in ("enter", "space"):
                 self.start_game()
             elif key in ("u", "s"):
@@ -392,6 +434,8 @@ class AirDefenseGame:
                     self.start_game()
                 elif self.hud.shop_button.hovered:
                     self.open_shop()
+                elif getattr(self.hud, "settings_button", None) is not None and self.hud.settings_button.hovered:
+                    self.open_settings()
                 elif self.hud.rebirth_button.hovered:
                     self.rebirth()
                 elif self.hud.quit_button.hovered:
@@ -517,6 +561,10 @@ class AirDefenseGame:
     def _reset_airstrike_guidance(self, *, clear_missiles: bool) -> None:
         """Reset lock/target state and optionally remove active target-bound missiles."""
 
+        hud = getattr(self, "hud", None)
+        clear_weapon_ui = getattr(hud, "clear_transient_weapon_ui", None)
+        if callable(clear_weapon_ui):
+            clear_weapon_ui()
         self.lock_tracker.set_scope_enabled(False)
         self.session.reset_airstrike_guidance(clear_missiles=clear_missiles)
         if self.session.wave_runtime is not None:
@@ -548,10 +596,11 @@ class AirDefenseGame:
     def _clear_active_missiles(self) -> None:
         """Remove every visual/domain missile before a target/session boundary."""
 
-        for missile_id in tuple(self.active_missiles):
+        for missile_id in tuple(getattr(self, "active_missiles", {})):
             self.scene.remove_guided_missile(missile_id)
-        self.active_missiles.clear()
+        getattr(self, "active_missiles", {}).clear()
         self.session.active_missile_ids.clear()
+        getattr(self, "active_volleys", {}).clear()
 
     def _reset_lock_after_shot(self) -> None:
         """Require a fresh full lock after each valid missile launch."""
@@ -607,7 +656,21 @@ class AirDefenseGame:
                 self.scene.remove_guided_missile(missile_id)
                 self.active_missiles.pop(missile_id, None)
                 self.session.active_missile_ids.discard(missile_id)
+        self._prune_active_volleys()
         return destroyed_any
+
+    def _prune_active_volleys(self) -> None:
+        """Drop completed volley snapshots after all of their missiles finish."""
+
+        volleys = getattr(self, "active_volleys", {})
+        active_missile_ids = set(getattr(self, "active_missiles", {}))
+        for volley_id, volley in tuple(volleys.items()):
+            missile_ids = {
+                str(missile_id)
+                for _target_id, missile_id in getattr(volley, "missile_ids", ())
+            }
+            if not missile_ids or not (missile_ids & active_missile_ids):
+                volleys.pop(volley_id, None)
 
     def _on_aircraft_destroyed(self, aircraft_id: Optional[str] = None) -> None:
         """Resolve one collision and immediately attach its source drop batch."""
@@ -814,24 +877,37 @@ class AirDefenseGame:
         if not aircrafts:
             return
 
-        lock_frame_size = config.AA_LOCK_FRAME_SIZE
+        is_multi_weapon = self.session.held_weapon == WeaponKind.MULTI_ANTI_AIRCRAFT
+        whitebox_scale = 1.0
         if self.session.profile is not None:
-            lock_frame_size *= effective_whitebox_scale(
+            whitebox_scale = effective_whitebox_scale(
                 self.session.profile,
                 config=self.session.progression_config,
             )
+        ordinary_lock_frame_size = config.AA_LOCK_FRAME_SIZE * whitebox_scale
+        lock_frame_size = ordinary_lock_frame_size * (
+            config.AA_MULTI_LOCK_FRAME_MULTIPLIER if is_multi_weapon else 1.0
+        )
         projections = self.scene.project_aircraft_targets(
             self.scene.aircraft_entities,
             lock_frame_size=lock_frame_size,
         )
         self._aircraft_screen_targets = projections
-        current_id = self.lock_tracker.target_aircraft_id
+        current_id = (
+            self.multi_lock_tracker.target_ids[0]
+            if is_multi_weapon and self.multi_lock_tracker.target_ids
+            else self.lock_tracker.target_aircraft_id
+        )
         current_projection = projections.get(current_id) if current_id is not None else None
         # A target remains sticky through the 0.75 s decay buffer, even while
         # another aircraft becomes a closer candidate.
         if (
             current_id is not None
-            and self.lock_tracker.progress > 0.0
+            and (
+                self.multi_lock_tracker.lock_progress.get(current_id, 0.0)
+                if is_multi_weapon
+                else self.lock_tracker.progress
+            ) > 0.0
             and current_id in aircrafts
             and aircrafts[current_id].phase not in (AircraftPhase.DESTROYED, AircraftPhase.IMPACTED)
         ):
@@ -840,7 +916,11 @@ class AirDefenseGame:
             target_projection = select_lock_target(
                 tuple(projections.values()),
                 current_target_id=None,
-                lock_progress=self.lock_tracker.progress,
+                lock_progress=(
+                    self.multi_lock_tracker.lock_progress.get(current_id, 0.0)
+                    if is_multi_weapon and current_id is not None
+                    else self.lock_tracker.progress
+                ),
             )
             if target_projection is not None:
                 current_id = target_projection.aircraft_id
@@ -870,45 +950,59 @@ class AirDefenseGame:
             target_projection = projections.get(current_id) if current_id is not None else None
 
         self._aircraft_screen_target = target_projection
-        self.lock_tracker.set_scope_enabled(scope_active)
-        if self.session.held_weapon == WeaponKind.MULTI_ANTI_AIRCRAFT:
-            eligible_ids = tuple(
-                target_id
-                for target_id, projection in sorted(projections.items())
-                if projection.visible and projection.in_lock_frame
-            )
-            self.multi_anti_aircraft.set_targets(eligible_ids)
-            self.multi_lock_tracker.target_capacity = (
-                multi_aa_target_count(
-                    self.session.profile,
-                    config=self.session.progression_config,
-                )
-                if self.session.profile is not None
-                else self.multi_lock_tracker.target_capacity
-            )
-            self.multi_lock_tracker.set_targets(eligible_ids)
+        if is_multi_weapon:
+            self.lock_tracker.set_scope_enabled(False)
             self.multi_lock_tracker.update(
                 projections,
                 delta_seconds,
                 scope_enabled=scope_active,
             )
-        lock_state = self.lock_tracker.update(
-            target_visible=bool(target_projection is not None and target_projection.visible),
-            target_in_frame=bool(target_projection is not None and target_projection.in_lock_frame),
-            delta_seconds=delta_seconds,
-            target_aircraft_id=current_id,
-        )
-        if self.anti_aircraft is not None:
-            self.anti_aircraft.lock_state = lock_state
-            self.anti_aircraft.lock_elapsed = self.lock_tracker.lock_elapsed
-            self.anti_aircraft.target_aircraft_id = self.lock_tracker.target_aircraft_id
-            self.anti_aircraft.target_in_zone = self.lock_tracker.target_in_frame
-        self.session.lock_state = lock_state
-        self.session.lock_elapsed = self.lock_tracker.lock_elapsed
-        self.session.target_in_zone = self.lock_tracker.target_in_frame
+            eligible_ids = tuple(
+                target_id
+                for target_id, projection in sorted(projections.items())
+                if projection.visible and projection.in_lock_frame
+            )
+            if self.multi_anti_aircraft is not None:
+                self.multi_anti_aircraft.set_targets(eligible_ids)
+            if self.multi_lock_tracker.all_targets_ready:
+                lock_state = LockState.GREEN_READY
+            elif any(progress > 0.0 for progress in self.multi_lock_tracker.lock_progress.values()):
+                lock_state = LockState.RED_TRACKING
+            else:
+                lock_state = LockState.WHITE
+            self.session.lock_state = lock_state
+            self.session.lock_elapsed = max(
+                self.multi_lock_tracker.lock_progress.values(),
+                default=0.0,
+            ) * self.multi_lock_tracker.lock_duration
+            self.session.target_in_zone = False
+        else:
+            self.multi_lock_tracker.set_scope_enabled(False)
+            if self.multi_anti_aircraft is not None:
+                self.multi_anti_aircraft.target_aircraft_ids.clear()
+            self.lock_tracker.set_scope_enabled(scope_active)
+            lock_state = self.lock_tracker.update(
+                target_visible=bool(target_projection is not None and target_projection.visible),
+                target_in_frame=bool(target_projection is not None and target_projection.in_lock_frame),
+                delta_seconds=delta_seconds,
+                target_aircraft_id=current_id,
+            )
+            if self.anti_aircraft is not None:
+                self.anti_aircraft.lock_state = lock_state
+                self.anti_aircraft.lock_elapsed = self.lock_tracker.lock_elapsed
+                self.anti_aircraft.target_aircraft_id = self.lock_tracker.target_aircraft_id
+                self.anti_aircraft.target_in_zone = self.lock_tracker.target_in_frame
+            self.session.lock_state = lock_state
+            self.session.lock_elapsed = self.lock_tracker.lock_elapsed
+            self.session.target_in_zone = self.lock_tracker.target_in_frame
         if runtime is not None:
             runtime.set_active_target(self.lock_tracker.target_aircraft_id)
-        self.session.active_aircraft_id = self.lock_tracker.target_aircraft_id or (
+        active_target_id = (
+            self.multi_lock_tracker.target_ids[0]
+            if is_multi_weapon and self.multi_lock_tracker.target_ids
+            else self.lock_tracker.target_aircraft_id
+        )
+        self.session.active_aircraft_id = active_target_id or (
             runtime.alive_aircraft_ids[0] if runtime is not None and runtime.alive_aircraft_ids else self.session.active_aircraft_id
         )
         self.session.active_aircraft_type = (
@@ -917,7 +1011,12 @@ class AirDefenseGame:
             else (aircrafts[self.session.active_aircraft_id].aircraft_type
                   if self.session.active_aircraft_id in aircrafts else None)
         )
-        if lock_state == LockState.GREEN_READY and target_projection is not None and target_projection.in_lock_frame:
+        if (
+            not is_multi_weapon
+            and lock_state == LockState.GREEN_READY
+            and target_projection is not None
+            and target_projection.in_lock_frame
+        ):
             target_aircraft = aircrafts.get(self.lock_tracker.target_aircraft_id)
             if target_aircraft is not None:
                 target_aircraft.mark_locked()
@@ -995,7 +1094,7 @@ class AirDefenseGame:
         self,
         encounter: Optional[GroundEncounter] = None,
     ) -> None:
-        """更新固定砲塔；每台只鎖定已落地的非 Boss 小兵。"""
+        """更新短射程固定砲塔與每次開火一發的地面曳光回饋。"""
 
         encounter = encounter or self._current_ground_encounter()
         if encounter is None or not getattr(self, "turrets", None):
@@ -1003,19 +1102,56 @@ class AirDefenseGame:
         members = tuple(encounter.crew)
         for turret in self.turrets:
             current = encounter.find(turret.target_id) if turret.target_id else None
-            if current is None or not current.alive or current.is_boss or current.behavior_state == CrewBehaviorState.DESCENDING:
-                target = select_turret_target(turret.position, members, max_range=80.0)
+            if (
+                current is None
+                or select_turret_target(
+                    turret.position,
+                    (current,),
+                    max_range=config.AUTO_DEFENSE_MAX_RANGE,
+                    allow_boss=True,
+                )
+                is None
+            ):
+                target = select_turret_target(
+                    turret.position,
+                    members,
+                    max_range=config.AUTO_DEFENSE_MAX_RANGE,
+                    allow_boss=True,
+                )
                 turret.assign_target(getattr(target, "id", None))
             if not turret.can_fire:
                 continue
             target = encounter.find(turret.target_id) if turret.target_id else None
-            if target is None:
+            damage = (
+                auto_defense_damage_for_target(target, turret.damage)
+                if target is not None
+                else 0
+            )
+            if target is None or damage <= 0:
                 turret.release_target()
                 continue
-            if turret.mark_fired() and damage_crew_member(
+            if not turret.mark_fired():
+                continue
+            tracer_id = f"auto-defense:{turret.id}:{target.id}:{turret.shot_sequence}"
+            tracer_event_ids = getattr(self, "_tracer_event_ids", set())
+            if tracer_id not in tracer_event_ids:
+                tracer_event_ids.add(tracer_id)
+                try:
+                    self.scene.create_ground_tracer(
+                        GroundTracerEffect(
+                            id=tracer_id,
+                            start_position=turret.position,
+                            target_position=target.position,
+                        )
+                    )
+                except Exception:
+                    # Visual feedback is optional; the already-fired gameplay
+                    # shot must still resolve exactly once.
+                    pass
+            if damage_crew_member(
                 encounter,
                 target.id,
-                turret.damage,
+                damage,
                 self.session,
             ):
                 self.scene.remove_crew_member(target.id)
@@ -1036,20 +1172,11 @@ class AirDefenseGame:
                 return
             if self.player.held_weapon == requested_weapon:
                 return
-            if (
-                previous_weapon in (
-                    WeaponKind.ANTI_AIRCRAFT,
-                    WeaponKind.MULTI_ANTI_AIRCRAFT,
-                )
-                and requested_weapon
-                not in (
-                    WeaponKind.ANTI_AIRCRAFT,
-                    WeaponKind.MULTI_ANTI_AIRCRAFT,
-                )
-            ):
-                self.session.set_anti_air_scope(False)
-                self.lock_tracker.set_scope_enabled(False)
-                self.multi_lock_tracker.reset()
+            if previous_weapon != requested_weapon:
+                # Every weapon-family change gets the same transient reset.
+                # Active missiles intentionally survive; they are independent
+                # projectiles and are cleared only at a terminal boundary.
+                self._reset_airstrike_guidance(clear_missiles=False)
             self.player.held_weapon = requested_weapon
             self.player.aim_mode = requested_weapon.value
             if requested_weapon == WeaponKind.SNIPER and self.sniper is not None:
@@ -1196,7 +1323,7 @@ class AirDefenseGame:
         # encounter even if a scene callback removes a visual entity midway
         # through the hit loop.
         encounter = self._current_ground_encounter()
-        target_id = self.scene.crew_under_center(config.SNIPER_MAX_RANGE)
+        target_id = self.scene.crew_under_center(config.PISTOL_MAX_RANGE)
         target: Optional[object] = None
         if target_id is not None and encounter is not None:
             target = encounter.find(target_id)
@@ -1206,7 +1333,7 @@ class AirDefenseGame:
             distance=distance_xz(self.scene.player_position(), getattr(target, "position", self.scene.player_position())),
             cooldown_remaining=self.rpg.fire_cooldown,
             ammo_remaining=self.rpg.ammo_remaining,
-            max_range=config.SNIPER_MAX_RANGE,
+            max_range=config.PISTOL_MAX_RANGE,
         ):
             return
         center = tuple(float(value) for value in getattr(target, "position", (0.0, 0.0, 0.0)))
@@ -1214,6 +1341,7 @@ class AirDefenseGame:
         explosion_id = f"rpg-{self._rpg_explosion_sequence:03d}"
         if not self.rpg.mark_fired(explosion_id):
             return
+        self._create_rpg_projectile(explosion_id, center)
         if self.session.profile is not None:
             self.rpg.fire_cooldown = effective_cooldown(
                 self.session.progression_config.rpg_cooldown_seconds,
@@ -1259,14 +1387,62 @@ class AirDefenseGame:
         # last aircraft/drop decision.
         self._try_complete_encounter()
 
+    def _create_rpg_projectile(
+        self,
+        explosion_id: str,
+        target_position: tuple[float, float, float],
+    ) -> None:
+        """Create visual RPG feedback without changing the damage timeline."""
+
+        camera_position = getattr(camera, "world_position", None)
+        camera_forward = getattr(camera, "forward", None)
+        if camera_position is None:
+            camera_position = self.scene.player_position()
+        try:
+            if camera_forward is None:
+                start_position = (
+                    float(camera_position.x),
+                    float(camera_position.y),
+                    float(camera_position.z),
+                )
+            else:
+                start_position = (
+                    float(camera_position.x) + float(camera_forward.x) * 1.5,
+                    float(camera_position.y) + float(camera_forward.y) * 1.5,
+                    float(camera_position.z) + float(camera_forward.z) * 1.5,
+                )
+        except (AttributeError, TypeError, ValueError):
+            player_position = self.scene.player_position()
+            start_position = (
+                float(player_position.x),
+                float(player_position.y),
+                float(player_position.z),
+            )
+        projectile = RPGProjectileEffect(
+            id=f"{explosion_id}-projectile",
+            start_position=start_position,
+            target_position=target_position,
+        )
+        create_projectile = getattr(self.scene, "create_rpg_projectile", None)
+        if not callable(create_projectile):
+            return
+        try:
+            create_projectile(projectile)
+        except Exception:
+            # A visual adapter failure must never undo an already valid RPG
+            # shot or make its gameplay damage happen twice.
+            return
+
     def _fire_multi_anti_aircraft(self) -> None:
-        """對多目標追蹤器的可發射 ID 建立一次齊射。"""
+        """Revalidate the complete set, then create one guided missile per ID."""
 
         if self.multi_anti_aircraft is None or self.session.phase not in (
             GamePhase.AIRSTRIKE,
             GamePhase.HYBRID_COMBAT,
             GamePhase.GROUND_COMBAT,
         ):
+            return
+        if not self.session.anti_air_scope_enabled:
             return
         ready_ids = self.multi_lock_tracker.fireable_targets()
         if not ready_ids or self.multi_anti_aircraft.fire_cooldown > 0.0:
@@ -1281,25 +1457,60 @@ class AirDefenseGame:
             return
         targets = getattr(self, "aircrafts", {})
         player_position = self.scene.player_position()
+        projections = getattr(self, "_aircraft_screen_targets", {})
         valid_ids: list[str] = []
         for target_id in ready_ids:
             target = targets.get(target_id)
-            if target is None or not is_valid_target(
+            projection = projections.get(target_id) if hasattr(projections, "get") else None
+            if (
+                target is None
+                or projection is None
+                or not bool(getattr(projection, "visible", False))
+                or not bool(getattr(projection, "in_lock_frame", False))
+                or not bool(getattr(projection, "eligible", True))
+                or not is_valid_target(
                 WeaponKind.MULTI_ANTI_AIRCRAFT,
                 target,
                 distance=distance_xz(player_position, target.position),
                 cooldown_remaining=self.multi_anti_aircraft.fire_cooldown,
                 max_range=config.SNIPER_MAX_RANGE,
+                )
             ):
-                continue
+                return
             valid_ids.append(target_id)
-            target.take_damage(1)
-            if target.phase == AircraftPhase.DESTROYED:
-                self._on_aircraft_destroyed(target_id)
         if not valid_ids:
             return
+
+        sequence_start = getattr(self, "_missile_sequence", 0) + 1
+        volley_id = f"multi-volley-{sequence_start:03d}"
+        created: list[GuidedMissile] = []
+        try:
+            for target_id in valid_ids:
+                missile = self._create_guided_missile(target_id)
+                created.append(missile)
+                self.active_missiles[missile.id] = missile
+                self.session.active_missile_ids.add(missile.id)
+                self.scene.create_guided_missile(missile)
+        except Exception:
+            for missile in created:
+                self.scene.remove_guided_missile(missile.id)
+                self.active_missiles.pop(missile.id, None)
+                self.session.active_missile_ids.discard(missile.id)
+            return
+
+        missile_pairs = tuple((target_id, missile.id) for target_id, missile in zip(valid_ids, created))
+        volley = MissileVolley(
+            volley_id=volley_id,
+            weapon=WeaponKind.MULTI_ANTI_AIRCRAFT,
+            target_ids=tuple(valid_ids),
+            missile_ids=missile_pairs,
+            cooldown_applied=True,
+        )
+        if not hasattr(self, "active_volleys"):
+            self.active_volleys = {}
+        self.active_volleys[volley_id] = volley
         self.multi_anti_aircraft.set_targets(valid_ids)
-        self.multi_anti_aircraft.mark_fired()
+        self.multi_anti_aircraft.mark_fired(volley_id)
         if self.session.profile is not None:
             self.multi_anti_aircraft.fire_cooldown = effective_cooldown(
                 config.AA_FIRE_COOLDOWN_SECONDS,
@@ -1307,10 +1518,25 @@ class AirDefenseGame:
                 config=self.session.progression_config,
             )
             if runtime_state is not None:
-                runtime_state.weapon_runtime[WeaponKind.MULTI_ANTI_AIRCRAFT].mark_fired(
-                    runtime_state.weapon_runtime[WeaponKind.MULTI_ANTI_AIRCRAFT].cooldown_duration
+                runtime_multi_weapon = runtime_state.weapon_runtime.get(
+                    WeaponKind.MULTI_ANTI_AIRCRAFT
                 )
-        self.multi_lock_tracker.mark_fired(f"volley-{self._missile_sequence + 1:03d}")
+                if runtime_multi_weapon is not None:
+                    runtime_multi_weapon.mark_fired(runtime_multi_weapon.cooldown_duration)
+        self.multi_lock_tracker.mark_fired(volley_id)
+
+    def _create_guided_missile(self, target_id: str) -> GuidedMissile:
+        """Create a target-bound missile shell without registering or firing it."""
+
+        self._missile_sequence = getattr(self, "_missile_sequence", 0) + 1
+        missile_id = f"{target_id}-missile-{self._missile_sequence:03d}"
+        missile_start = camera.world_position + camera.forward * 1.5
+        return GuidedMissile(
+            id=missile_id,
+            target_aircraft_id=target_id,
+            position=(float(missile_start.x), float(missile_start.y), float(missile_start.z)),
+            forward=(float(camera.forward.x), float(camera.forward.y), float(camera.forward.z)),
+        )
 
     def _fire_anti_aircraft(self) -> None:
         aircrafts = getattr(self, "aircrafts", {})
@@ -1509,14 +1735,12 @@ class AirDefenseGame:
     def _clear_current_wave_visuals(self) -> None:
         """Remove current-wave combat entities while preserving short effects."""
 
-        self._clear_active_missiles()
+        self._reset_airstrike_guidance(clear_missiles=True)
         self.scene.clear_dynamic(clear_effects=False)
         self.encounter = None
         self.aircraft = None
         self.aircrafts.clear()
         getattr(self, "turrets", []).clear()
-        if getattr(self, "multi_lock_tracker", None) is not None:
-            self.multi_lock_tracker.reset()
         self._aircraft_screen_target = None
         getattr(self, "_aircraft_screen_targets", {}).clear()
         getattr(self, "_tracer_event_ids", set()).clear()
@@ -1641,7 +1865,7 @@ class AirDefenseGame:
     def _finish_profile_failure(self, reason: str) -> None:
         """將新流程的死亡結果整理後返回同一存檔主選單。"""
 
-        self._clear_active_missiles()
+        self._reset_airstrike_guidance(clear_missiles=True)
         self.scene.clear_dynamic(clear_effects=False)
         self.aircrafts.clear()
         self.aircraft = None
@@ -1649,7 +1873,6 @@ class AirDefenseGame:
         self._aircraft_screen_target = None
         self._aircraft_screen_targets.clear()
         self._tracer_event_ids.clear()
-        self.lock_tracker.set_scope_enabled(False)
         self.scene.set_scope_enabled(False)
         self.scene.set_gameplay_enabled(False)
         self.hud.update_profile_summary(
@@ -1756,6 +1979,11 @@ class AirDefenseGame:
             )
         if self.session.held_weapon == WeaponKind.MULTI_ANTI_AIRCRAFT:
             locked_target_ids = self.multi_lock_tracker.target_ids
+        multi_lock_views = (
+            self.multi_lock_tracker.build_views(self._aircraft_screen_targets)
+            if self.session.held_weapon == WeaponKind.MULTI_ANTI_AIRCRAFT
+            else ()
+        )
         if getattr(self, "turrets", None):
             turret_count = len(self.turrets)
         active_aircraft_type = wave_view.selected_aircraft_type or self.session.active_aircraft_type
@@ -1855,6 +2083,12 @@ class AirDefenseGame:
                 ),
                 profile=self.session.profile,
                 progression_config=self.session.progression_config,
+            ),
+            multi_lock_views=multi_lock_views,
+            anti_air_gui_mode=getattr(
+                self,
+                "anti_air_gui_mode",
+                AntiAirGuiMode.NEW,
             ),
         )
 

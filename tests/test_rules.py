@@ -5,7 +5,8 @@ from __future__ import annotations
 import unittest
 from math import dist
 from pathlib import Path
-from unittest.mock import patch
+from tempfile import TemporaryDirectory
+from unittest.mock import Mock, patch
 
 from air_defense import config
 from air_defense.entities import (
@@ -39,6 +40,7 @@ from air_defense.rules import (
     apply_city_damage,
     resolve_aircraft_outcome,
     try_pickup_weapon,
+    vector_length,
     WaveDirector,
     warning_active,
 )
@@ -57,6 +59,7 @@ from air_defense.state import (
     WavePlan,
     WaveRuntime,
 )
+from air_defense.progression import calculate_reward
 
 
 class FixedRandom:
@@ -67,6 +70,58 @@ class FixedRandom:
     def randint(self, minimum: int, maximum: int) -> int:
         self.calls.append((minimum, maximum))
         return max(minimum, min(maximum, self.value))
+
+
+class SceneDirectionTests(unittest.TestCase):
+    def test_ground_rotation_faces_reverse_z_without_roll(self) -> None:
+        from air_defense.scene import canonical_ground_rotation_for_direction
+
+        self.assertEqual(
+            canonical_ground_rotation_for_direction((0.0, 0.0, -1.0)),
+            (0.0, 180.0, 0.0),
+        )
+
+    def test_canonical_rotation_keeps_reverse_heading_upright(self) -> None:
+        from air_defense.scene import canonical_rotation_for_direction
+
+        self.assertEqual(
+            canonical_rotation_for_direction((0.0, 0.0, -1.0)),
+            (0.0, 180.0, 0.0),
+        )
+        pitch, yaw, roll = canonical_rotation_for_direction((1.0, 1.0, -1.0))
+        self.assertLess(pitch, 0.0)
+        self.assertGreater(yaw, 0.0)
+        self.assertEqual(roll, 0.0)
+
+    def test_crew_facing_uses_travel_then_next_route_target(self) -> None:
+        from air_defense.scene import AirDefenseScene
+
+        member = CrewMember(
+            id="direction-crew",
+            encounter_id="direction-encounter",
+            cover_node="cover-city",
+            target_cover_node="cover-city",
+            squad_role=SquadRole.COVER_SHOOTER,
+            position=(0.0, 0.0, 0.0),
+        )
+        initial = AirDefenseScene._crew_facing_direction(member, None)
+        self.assertIsNotNone(initial)
+        self.assertAlmostEqual(float(initial.x), 0.0)
+        self.assertLess(float(initial.z), 0.0)
+
+        member.position = (1.0, 0.0, -2.0)
+        movement = AirDefenseScene._crew_facing_direction(
+            member,
+            (0.0, 0.0, 0.0),
+        )
+        self.assertEqual(tuple(round(float(value), 4) for value in movement), (1.0, 0.0, -2.0))
+
+        member.position = config.COVER_NODE_POSITIONS["cover-city"]
+        member.target_cover_node = "cover-east"
+        next_target = AirDefenseScene._crew_facing_direction(member, member.position)
+        self.assertIsNotNone(next_target)
+        self.assertGreater(float(next_target.x), 0.0)
+        self.assertGreater(float(next_target.z), 0.0)
 
 
 class SessionStateTests(unittest.TestCase):
@@ -336,6 +391,8 @@ class GroundEncounterRuleTests(unittest.TestCase):
             random_source=FixedRandom(2),
         )
         target = encounter.crew[0]
+        for _ in range(config.GROUND_MINION_HEALTH - 1):
+            self.assertFalse(defeat_crew_member(encounter, target.id, session))
         self.assertTrue(defeat_crew_member(encounter, target.id, session))
         self.assertFalse(target.alive)
         self.assertFalse(defeat_crew_member(encounter, target.id, session))
@@ -362,7 +419,14 @@ class GroundEncounterRuleTests(unittest.TestCase):
         self.assertTrue(target.alive)
 
         session.active_encounter_id = encounter.id
-        self.assertTrue(damage_crew_member(encounter, target.id, 1, session))
+        self.assertTrue(
+            damage_crew_member(
+                encounter,
+                target.id,
+                config.GROUND_MINION_HEALTH,
+                session,
+            )
+        )
         self.assertEqual(session.stats.enemies_defeated, 1)
 
         replacement = EncounterFactory().create_for_aircraft(
@@ -481,7 +545,14 @@ class StatisticsTests(unittest.TestCase):
                 random_source=FixedRandom(2),
             )
             for member in encounter.crew:
-                self.assertTrue(defeat_crew_member(encounter, member.id, session))
+                self.assertTrue(
+                    damage_crew_member(
+                        encounter,
+                        member.id,
+                        config.GROUND_MINION_HEALTH,
+                        session,
+                    )
+                )
             self.assertTrue(encounter.cleared)
             session.transition(
                 SessionEvent.CREW_CLEARED,
@@ -520,6 +591,199 @@ class StatisticsTests(unittest.TestCase):
             )
 
         self.assertEqual(entity_factory.call_args.kwargs["model"], "cube")
+
+    def test_runtime_obj_uses_explicit_ursina_folder_loader(self) -> None:
+        from air_defense.asset_manifest import runtime_asset_choice
+        from air_defense.lighting import lit_with_sun_specular_shader
+        from air_defense.scene import AirDefenseScene
+
+        scene = AirDefenseScene.__new__(AirDefenseScene)
+        scene.asset_root = Path("assets/air_defense").resolve()
+        with TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            obj_path = output_root / "aircraft_normal.obj"
+            obj_path.write_text(
+                "v 0 0 0\nv 1 0 0\nv 0 1 1\nf 1 2 3\n",
+                encoding="utf-8",
+            )
+            choice = runtime_asset_choice("aircraft_normal", output_root)
+            fake_mesh = object()
+            fake_entity = Mock()
+            with (
+                patch("air_defense.scene.load_model", return_value=fake_mesh) as loader,
+                patch("air_defense.scene.Entity", return_value=fake_entity) as entity_factory,
+            ):
+                result = scene.create_optional_model(
+                    "aircraft_normal.obj",
+                    asset_id="aircraft_normal",
+                    asset_choice=choice,
+                    position=(0, 0, 0),
+                )
+
+        loader.assert_called_once_with(
+            "aircraft_normal",
+            folder=obj_path.parent,
+            use_deepcopy=True,
+        )
+        self.assertIs(entity_factory.call_args.kwargs["model"], fake_mesh)
+        self.assertIs(
+            entity_factory.call_args.kwargs["shader"],
+            lit_with_sun_specular_shader,
+        )
+        self.assertIs(result, fake_entity)
+
+    def test_runtime_obj_keeps_tint_and_direction_metadata_per_instance(self) -> None:
+        from air_defense.asset_manifest import ASSET_MANIFEST, runtime_asset_choice
+        from air_defense.scene import AirDefenseScene
+
+        scene = AirDefenseScene.__new__(AirDefenseScene)
+        scene.asset_root = Path("assets/air_defense").resolve()
+        with TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            obj = "v 0 0 0\nv 1 0 0\nv 0 1 1\nf 1 2 3\n"
+            for asset_id in ("aircraft_normal", "aircraft_boss"):
+                (output_root / ASSET_MANIFEST[asset_id].output_file).write_text(
+                    obj,
+                    encoding="utf-8",
+                )
+            normal_choice = runtime_asset_choice("aircraft_normal", output_root)
+            boss_choice = runtime_asset_choice("aircraft_boss", output_root)
+            normal_entity = Mock()
+            boss_entity = Mock()
+            with (
+                patch("air_defense.scene.load_model", return_value=object()),
+                patch(
+                    "air_defense.scene.Entity",
+                    side_effect=(normal_entity, boss_entity),
+                ) as entity_factory,
+            ):
+                normal = scene.create_optional_model(
+                    "aircraft_normal.obj",
+                    asset_id="aircraft_normal",
+                    asset_choice=normal_choice,
+                    position=(0, 0, 0),
+                )
+                boss = scene.create_optional_model(
+                    "aircraft_boss.obj",
+                    asset_id="aircraft_boss",
+                    asset_choice=boss_choice,
+                    position=(0, 0, 0),
+                )
+
+        self.assertEqual(entity_factory.call_count, 2)
+        self.assertTrue(normal.asset_mesh_isolated)
+        self.assertTrue(boss.asset_mesh_isolated)
+        self.assertEqual(normal.asset_canonical_up, "+Y")
+        self.assertEqual(normal.asset_canonical_forward, "+Z")
+        self.assertEqual(boss.asset_canonical_up, "+Y")
+        self.assertEqual(boss.asset_canonical_forward, "+Z")
+        self.assertEqual(normal.asset_runtime_tint, ASSET_MANIFEST["aircraft_normal"].runtime_tint)
+        self.assertEqual(boss.asset_runtime_tint, ASSET_MANIFEST["aircraft_boss"].runtime_tint)
+        self.assertNotEqual(normal.asset_runtime_tint, boss.asset_runtime_tint)
+        self.assertIn("color", entity_factory.call_args_list[0].kwargs)
+        self.assertIn("color", entity_factory.call_args_list[1].kwargs)
+
+    def test_runtime_obj_loader_failure_uses_isolated_fallback(self) -> None:
+        from air_defense.asset_manifest import runtime_asset_choice
+        from air_defense.scene import AirDefenseScene
+
+        scene = AirDefenseScene.__new__(AirDefenseScene)
+        scene.asset_root = Path("assets/air_defense").resolve()
+        with TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            obj_path = output_root / "aircraft_normal.obj"
+            obj_path.write_text(
+                "v 0 0 0\nv 1 0 0\nv 0 1 1\nf 1 2 3\n",
+                encoding="utf-8",
+            )
+            choice = runtime_asset_choice("aircraft_normal", output_root)
+            fake_entity = Mock()
+            with (
+                patch("air_defense.scene.load_model", side_effect=ValueError("bad OBJ")),
+                patch("air_defense.scene.Entity", return_value=fake_entity) as entity_factory,
+            ):
+                result = scene.create_optional_model(
+                    "aircraft_normal.obj",
+                    asset_id="aircraft_normal",
+                    asset_choice=choice,
+                    fallback_model="cube",
+                    fallback_scale=(1.0, 2.0, 3.0),
+                    position=(0, 0, 0),
+                )
+
+        resolved_choice = result.runtime_asset_choice
+        self.assertTrue(resolved_choice.fallback_used)
+        self.assertIsNone(resolved_choice.model_path)
+        self.assertIn("bad OBJ", resolved_choice.load_error or "")
+        self.assertEqual(entity_factory.call_count, 1)
+        self.assertEqual(entity_factory.call_args.kwargs["model"], "cube")
+        self.assertEqual(entity_factory.call_args.kwargs["scale"], (1.0, 2.0, 3.0))
+
+    def test_runtime_asset_choice_isolated_for_missing_obj(self) -> None:
+        from air_defense.asset_manifest import runtime_asset_choice
+
+        with TemporaryDirectory() as temporary_directory:
+            output_root = Path(temporary_directory)
+            (output_root / "aircraft_normal.obj").write_text(
+                "v 0 0 0\nv 1 0 0\nv 0 1 1\nf 1 2 3\n",
+                encoding="utf-8",
+            )
+            normal = runtime_asset_choice("aircraft_normal", output_root)
+            missing_boss = runtime_asset_choice("aircraft_boss", output_root)
+
+        self.assertFalse(normal.fallback_used)
+        self.assertTrue(missing_boss.fallback_used)
+        self.assertNotEqual(normal.asset_id, missing_boss.asset_id)
+
+    def test_fr022_non_target_regression_bundle(self) -> None:
+        self.assertTrue(
+            can_fire_anti_air(
+                LockState.GREEN_READY,
+                0.0,
+                target_in_zone=True,
+                target_aircraft_id="aircraft-regression",
+            )
+        )
+        self.assertTrue(can_fire_sniper(0.0, target_distance=config.SNIPER_MAX_RANGE))
+        self.assertTrue(can_fire_pistol(0.0, target_distance=config.PISTOL_MAX_RANGE))
+
+        aircraft = Aircraft(
+            id="aircraft-regression",
+            aircraft_type=AircraftType.NORMAL,
+            position=(0.0, 10.0, 10.0),
+            forward=(0.0, 0.0, 1.0),
+            speed=10.0,
+        )
+        previous_position = aircraft.position
+        aircraft.advance(0.1)
+        self.assertLessEqual(
+            vector_length(tuple(current - previous for current, previous in zip(aircraft.position, previous_position))),
+            1.0 + 1e-6,
+        )
+
+        encounter = EncounterFactory().create_for_aircraft(
+            "aircraft-ground-regression",
+            AircraftType.MANPOWER_SUPPORT,
+            random_source=FixedRandom(2),
+        )
+        self.assertTrue(encounter.crew)
+        building = TargetBuilding()
+        member = encounter.crew[0]
+        member.position = config.CITY_ATTACK_POINT
+        member.at_city = True
+        self.assertFalse(apply_city_damage(encounter, building, 0.0))
+        self.assertFalse(apply_city_damage(encounter, building, 1.0))
+        self.assertLess(building.health, config.CITY_MAX_HEALTH)
+
+        self.assertGreater(
+            calculate_reward("1-1", 0, maximum_aircraft_count=2),
+            0,
+        )
+        with TemporaryDirectory() as temporary_directory:
+            from air_defense.asset_manifest import runtime_asset_choice
+
+            fallback = runtime_asset_choice("target_building", Path(temporary_directory))
+            self.assertTrue(fallback.fallback_used)
 
 
 class AircraftTypeRuleTests(unittest.TestCase):
@@ -927,7 +1191,7 @@ class AircraftEnemyDescentRuleTests(unittest.TestCase):
         self.assertEqual(encounter.batch_progress("aircraft-a"), BatchProgress("aircraft-a", 6, 6, 0))
 
         defeated = first[0]
-        self.assertTrue(defeated.take_damage())
+        self.assertTrue(defeated.take_damage(config.GROUND_MINION_HEALTH))
         self.assertTrue(encounter.record_crew_cleared(defeated.id))
         self.assertFalse(encounter.record_crew_cleared(defeated.id))
         self.assertEqual(encounter.batch_progress("aircraft-a").cleared_count, 1)
@@ -944,7 +1208,7 @@ class AircraftEnemyDescentRuleTests(unittest.TestCase):
                 (0.0, 20.0, 30.0),
             )
         )
-        self.assertTrue(members[0].take_damage())
+        self.assertTrue(members[0].take_damage(config.GROUND_MINION_HEALTH))
 
         encounter = GroundEncounter(
             aircraft_id="wave-1",
@@ -988,7 +1252,14 @@ class AircraftEnemyDescentRuleTests(unittest.TestCase):
         session.start_new_game(WaveDirector().plan_wave(1, aircraft_count=1, cap=2))
         session.phase = GamePhase.HYBRID_COMBAT
         session.active_encounter_id = encounter.id
-        self.assertTrue(damage_crew_member(encounter, member.id, 1, session))
+        self.assertTrue(
+            damage_crew_member(
+                encounter,
+                member.id,
+                config.GROUND_MINION_HEALTH,
+                session,
+            )
+        )
         self.assertEqual(session.stats.enemies_defeated, 1)
         self.assertFalse(encounter.record_crew_cleared(member.id))
 

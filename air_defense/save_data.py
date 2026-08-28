@@ -27,6 +27,7 @@ from .progression import (
     ProgressionConfig,
     derive_upgrade_caps,
     normalize_upgrade_id,
+    UPGRADE_MULTI_AA_TARGETS,
 )
 
 
@@ -57,6 +58,7 @@ KNOWN_UPGRADE_IDS = frozenset(
         "multi_anti_aircraft_targets",
     }
 )
+LEGACY_UPGRADE_IDS = frozenset({UPGRADE_MULTI_AA_TARGETS})
 
 
 class SaveDataError(ValueError):
@@ -112,7 +114,7 @@ class SaveProfile:
             raise SaveDataError("last_completed_a_b 必須是字串或 null")
 
         self.upgrade_levels = _normalize_levels(self.upgrade_levels)
-        self.upgrade_caps = _normalize_caps(self.upgrade_caps)
+        normalized_caps = _normalize_caps(self.upgrade_caps)
         self.unlocked_weapons = _normalize_weapons(self.unlocked_weapons)
         if self.last_completed_a_b is not None:
             self.last_completed_a_b = self.last_completed_a_b.strip()
@@ -124,8 +126,19 @@ class SaveProfile:
         # 這個欄位是可修正的診斷快照，不接受它覆寫來源規則。
         self.max_aircraft_count = expected_a
         expected_caps = derive_upgrade_caps(self, config=self.config)
-        self.upgrade_caps = expected_caps
+        # Preserve schema-1 target-count snapshots for round-trip
+        # compatibility, while keeping them out of the effective caps map.
+        self.upgrade_caps = {
+            **expected_caps,
+            **{
+                upgrade_id: normalized_caps[upgrade_id]
+                for upgrade_id in LEGACY_UPGRADE_IDS
+                if upgrade_id in normalized_caps
+            },
+        }
         for upgrade_id, level in self.upgrade_levels.items():
+            if upgrade_id in LEGACY_UPGRADE_IDS:
+                continue
             if level > expected_caps.get(upgrade_id, 1):
                 raise SaveDataError(f"升級 {upgrade_id} 超過目前購買上限")
 
@@ -194,13 +207,20 @@ class SaveProfile:
             last_completed = last_completed.strip()
         _validate_last_completed(last_completed)
 
-        expected_a = config.maximum_aircraft_count(rebirth_count)
         expected_caps = derive_upgrade_caps(rebirth_count, config=config)
+        expected_caps.update(
+            {
+                upgrade_id: caps[upgrade_id]
+                for upgrade_id in LEGACY_UPGRADE_IDS
+                if upgrade_id in caps
+            }
+        )
         for upgrade_id, level in levels.items():
+            if upgrade_id in LEGACY_UPGRADE_IDS:
+                continue
             if level > expected_caps.get(upgrade_id, 1):
                 raise SaveDataError(f"升級 {upgrade_id} 超過目前購買上限")
         # 保存的 max A/caps 可是舊快照；來源欄位是 rebirth_count。
-        del expected_a, caps
         profile = cls(
             schema_version=SCHEMA_VERSION,
             coins=coins,

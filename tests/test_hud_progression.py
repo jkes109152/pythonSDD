@@ -38,7 +38,8 @@ class HudProgressionTests(unittest.TestCase):
         button_text = "\n".join(button.text for button in hud.shop_upgrade_buttons)
         self.assertIn("最大 HP", button_text)
         self.assertIn("RPG", button_text)
-        self.assertIn("多目標鎖定數量", button_text)
+        self.assertIn("防空炮白框大小", button_text)
+        self.assertNotIn("多目標鎖定數量", button_text)
 
     def test_shop_item_uses_compact_number_level_cap_and_price_format(self) -> None:
         hud = self._hud_stub()
