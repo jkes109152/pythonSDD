@@ -184,9 +184,17 @@ python -m air_defense.main
 
 ## PR 交付紀錄（T059）
 
-完成 T057／T058 後，T059 必須把實際 PR URL、`main` base、功能分支、對應的
-`spec.md`／`plan.md`／`tasks.md`、測試／手動驗收結果與已知限制寫回本節；通過程式碼
-審查前不得宣稱可合併。
+本次 PR：[#7](https://github.com/jkes109152/pythonSDD/pull/7)
+
+- PR URL：`https://github.com/jkes109152/pythonSDD/pull/7`
+- base：`main`
+- head：`007-3d-assets-weapon-targeting`
+- 提交：`e4a26e5`（`feat: integrate 3D assets and weapon targeting`）
+- SDD 對應：本目錄的 `spec.md`、`plan.md`、`tasks.md`，以及本文件的驗證紀錄。
+- 驗證：218 個 unittest、compileall、OBJ `--check`、staged diff check、實際模型載入與
+  fallback smoke 均通過；使用者已回報人工功能驗收沒有問題。
+- 限制：30 秒平均／最低 FPS 尚未取得數值，T058 仍待補記；在程式碼審查與必要驗收完成前
+  不宣稱 PR 可合併，也不建立正式 Release。
 
 ## 補充需求驗收紀錄（RPG／陸地自動防禦）
 

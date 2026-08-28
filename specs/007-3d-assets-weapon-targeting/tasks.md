@@ -205,7 +205,7 @@ description: "3D 資產與武器瞄準整合的依賴排序實作任務"
 - [X] T066 [US1] 修正人物瞄準判定過小：在 `AssetSpec` 增加 `aim_collider_multiplier`，由 `scene.py` 建立地面人物中央準心射線使用的獨立 box（包含 OBJ 與 fallback），且不改變人物外觀、武器射程、傷害或陸地自動防禦規則；補齊資產契約、測試與回歸驗證。
 - [X] T067 [US1] 依最新補充將一般／Boss 地面人物的瞄準 box 調整為與敵人可見外觀相同大小：外部 OBJ 使用與 `visual_scale_multiplier=5.0` 相同的瞄準包絡，fallback 使用 unit local box 配合 fallback 尺寸；更新 manifest、scene、資產文件、quickstart 與回歸測試。
 - [ ] T058 依 `specs/007-3d-assets-weapon-targeting/quickstart.md` 執行 1280×720、A=5 的遊戲 smoke、模型方向／fallback、舊版／新版瞄準、RPG 邊界與綠色長方體、自動防禦短射程／三發／Boss 50%／曳光、多目標 10+ 齊射、升級重載與生命週期手動驗收；暖機 5 秒後記錄 30 秒平均／最低 FPS，無圖形環境時明確記錄為未量測。
-- [ ] T059 依憲章在目前功能分支推送並建立以 `main` 為 base 的 PR，於 `specs/007-3d-assets-weapon-targeting/quickstart.md` 記錄 PR URL、base branch、對應的 `spec.md`／`plan.md`／`tasks.md`、T057／T058 結果與已知限制；未通過審查不得宣稱可合併。
+- [X] T059 依憲章在目前功能分支推送並建立以 `main` 為 base 的 PR（[#7](https://github.com/jkes109152/pythonSDD/pull/7)），並於 `specs/007-3d-assets-weapon-targeting/quickstart.md` 記錄 PR URL、base branch、對應的 `spec.md`／`plan.md`／`tasks.md`、T057 結果與 T058 尚待補記的 FPS 限制；未通過審查不得宣稱可合併。
 
 ---
 
